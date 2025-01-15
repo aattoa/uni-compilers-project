@@ -43,6 +43,9 @@ impl<'a> PosChars<'a> {
     pub fn starts_with(&self, prefix: &str) -> bool {
         self.clone().take(prefix.chars().count()).eq(prefix.chars())
     }
+    pub fn consume(&mut self, char: char) -> bool {
+        self.next_if_eq(char).is_some()
+    }
 }
 
 #[cfg(test)]

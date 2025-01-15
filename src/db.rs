@@ -16,6 +16,27 @@ pub struct View {
     pub end: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Severity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+#[derive(Clone, Debug)]
+pub struct Diagnostic {
+    pub message: String,
+    pub range: Range,
+    pub severity: Severity,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Ranged<T> {
+    pub value: T,
+    pub range: Range,
+}
+
 impl View {
     pub fn string(self, str: &str) -> &str {
         &str[(self.begin as usize)..(self.end as usize)]
@@ -31,5 +52,17 @@ impl Position {
         else {
             self.character += 1;
         }
+    }
+}
+
+impl Range {
+    pub fn for_position(begin: Position) -> Self {
+        Self { begin, end: Position { character: begin.character + 1, ..begin } }
+    }
+}
+
+impl Diagnostic {
+    pub fn error(range: Range, message: impl Into<String>) -> Self {
+        Self { message: message.into(), range, severity: Severity::Error }
     }
 }

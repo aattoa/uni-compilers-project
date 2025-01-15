@@ -10,6 +10,7 @@ pub enum TokenKind {
     BraceOpen,
     BraceClose,
     Comma,
+    Colon,
     Semicolon,
     Plus,
     Minus,
@@ -22,6 +23,7 @@ pub enum TokenKind {
     LessEqual,
     Greater,
     GreaterEqual,
+    RightArrow,
     Error,
 }
 
@@ -44,16 +46,28 @@ fn next_token(char: char, chars: &mut PosChars) -> TokenKind {
         '{' => TokenKind::BraceOpen,
         '}' => TokenKind::BraceClose,
         ',' => TokenKind::Comma,
+        ':' => TokenKind::Colon,
         ';' => TokenKind::Semicolon,
         '+' => TokenKind::Plus,
         '-' => TokenKind::Minus,
         '*' => TokenKind::Star,
         '/' => TokenKind::Slash,
 
-        '!' => chars.next_if_eq('=').map_or(TokenKind::Error, |_| TokenKind::NotEqual),
-        '=' => chars.next_if_eq('=').map_or(TokenKind::Equal, |_| TokenKind::EqualEqual),
-        '<' => chars.next_if_eq('=').map_or(TokenKind::Less, |_| TokenKind::LessEqual),
-        '>' => chars.next_if_eq('=').map_or(TokenKind::Greater, |_| TokenKind::GreaterEqual),
+        '!' => (if chars.consume('=') { TokenKind::NotEqual } else { TokenKind::Error }),
+        '<' => (if chars.consume('=') { TokenKind::Less } else { TokenKind::LessEqual }),
+        '>' => (if chars.consume('=') { TokenKind::Greater } else { TokenKind::GreaterEqual }),
+
+        '=' => {
+            if chars.consume('=') {
+                TokenKind::EqualEqual
+            }
+            else if chars.consume('>') {
+                TokenKind::RightArrow
+            }
+            else {
+                TokenKind::Equal
+            }
+        }
 
         _ if char.is_ascii_alphabetic() || char == '_' => {
             while chars.next_if(|char| char.is_ascii_alphanumeric() || char == '_').is_some() {}
@@ -102,11 +116,56 @@ impl<'a> Lexer<'a> {
     pub fn new(document: &'a str) -> Self {
         Self { chars: PosChars::new(document), next: None }
     }
+    pub fn position(&self) -> db::Position {
+        self.chars.position
+    }
     pub fn peek(&mut self) -> Option<Token> {
         if self.next.is_none() {
             self.next = lex(&mut self.chars);
         }
         self.next
+    }
+    pub fn next_if(&mut self, predicate: impl FnOnce(Token) -> bool) -> Option<Token> {
+        match self.peek() {
+            Some(token) if predicate(token) => self.next(),
+            _ => None,
+        }
+    }
+    pub fn next_if_kind(&mut self, kind: TokenKind) -> Option<Token> {
+        self.next_if(|token| token.kind == kind)
+    }
+    pub fn unlex(&mut self, token: Token) {
+        assert!(self.next.is_none());
+        self.next = Some(token);
+    }
+}
+
+impl TokenKind {
+    pub fn show(self) -> &'static str {
+        match self {
+            TokenKind::Identifier => "an identifier",
+            TokenKind::Integer => "an integer",
+            TokenKind::ParenOpen => "an opening parenthesis",
+            TokenKind::ParenClose => "a closing parenthesis",
+            TokenKind::BraceOpen => "an opening brace",
+            TokenKind::BraceClose => "a closing brace",
+            TokenKind::Comma => "a comma",
+            TokenKind::Colon => "a colon",
+            TokenKind::Semicolon => "a semicolon",
+            TokenKind::Plus => "a plus sign",
+            TokenKind::Minus => "a minus sign",
+            TokenKind::Star => "an asterisk",
+            TokenKind::Slash => "a slash",
+            TokenKind::Equal => "an equals sign",
+            TokenKind::EqualEqual => "a double equals sign",
+            TokenKind::NotEqual => "a not equals sign",
+            TokenKind::Less => "a less-than sign",
+            TokenKind::LessEqual => "a less-than-or-equal-to sign",
+            TokenKind::Greater => "a greater-than sign",
+            TokenKind::GreaterEqual => "a greater-than-or-equal-to sign",
+            TokenKind::RightArrow => "a right arrow",
+            TokenKind::Error => "a lexical error",
+        }
     }
 }
 
