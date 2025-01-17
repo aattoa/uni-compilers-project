@@ -16,6 +16,7 @@ pub enum TokenKind {
     Minus,
     Star,
     Slash,
+    Percent,
     Equal,
     EqualEqual,
     NotEqual,
@@ -52,6 +53,7 @@ fn next_token(char: char, chars: &mut PosChars) -> TokenKind {
         '-' => TokenKind::Minus,
         '*' => TokenKind::Star,
         '/' => TokenKind::Slash,
+        '%' => TokenKind::Percent,
 
         '!' => (if chars.consume('=') { TokenKind::NotEqual } else { TokenKind::Error }),
         '<' => (if chars.consume('=') { TokenKind::Less } else { TokenKind::LessEqual }),
@@ -156,6 +158,7 @@ impl TokenKind {
             TokenKind::Minus => "a minus sign",
             TokenKind::Star => "an asterisk",
             TokenKind::Slash => "a slash",
+            TokenKind::Percent => "a percent sign",
             TokenKind::Equal => "an equals sign",
             TokenKind::EqualEqual => "a double equals sign",
             TokenKind::NotEqual => "a not equals sign",

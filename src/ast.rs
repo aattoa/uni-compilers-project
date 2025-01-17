@@ -4,10 +4,11 @@ use crate::indexvec::{IndexVec, VecIndex};
 define_index!(pub ExprId);
 define_index!(pub TypeId);
 define_index!(pub NameId);
+define_index!(pub FuncId);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BinaryOp {
-    Equal,
+    Assign,
     EqualEqual,
     NotEqual,
     Less,
@@ -40,6 +41,9 @@ pub enum Expr {
     Variable {
         name: NameId,
     },
+    Parenthesized {
+        inner: ExprId,
+    },
     Declaration {
         name: NameId,
         typ: Option<TypeId>,
@@ -49,7 +53,7 @@ pub enum Expr {
         result: Option<ExprId>,
     },
     Block {
-        expressions: Vec<Expr>,
+        expressions: Vec<ExprId>,
     },
     Conditional {
         condition: ExprId,
@@ -104,10 +108,10 @@ pub struct Function {
     pub body: ExprId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum TopLevel {
-    Expr(Expr),
-    Function(Function),
+    Expr(ExprId),
+    Func(FuncId),
 }
 
 #[derive(Default)]
@@ -115,6 +119,7 @@ pub struct Arena {
     pub expr: IndexVec<Expr, ExprId>,
     pub typ: IndexVec<Type, TypeId>,
     pub name: IndexVec<String, NameId>,
+    pub func: IndexVec<Function, FuncId>,
 }
 
 pub struct Module {

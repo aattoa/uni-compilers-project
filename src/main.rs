@@ -1,5 +1,5 @@
 #![allow(unused_parens, dead_code)]
-#![feature(trait_alias)]
+#![feature(trait_alias, let_chains)]
 
 mod ast;
 mod db;
