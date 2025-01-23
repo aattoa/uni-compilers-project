@@ -1,9 +1,8 @@
-use crate::define_index;
-use crate::indexvec::{IndexVec, VecIndex};
+use crate::indexvec::IndexVec;
+use crate::{db, define_index};
 
 define_index!(pub ExprId);
 define_index!(pub TypeId);
-define_index!(pub NameId);
 define_index!(pub FuncId);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,7 +30,7 @@ pub enum UnaryOp {
 }
 
 #[derive(Clone, Debug)]
-pub enum Expr {
+pub enum ExprKind {
     Integer {
         literal: i64,
     },
@@ -39,13 +38,13 @@ pub enum Expr {
         literal: bool,
     },
     Variable {
-        name: NameId,
+        name: db::Name,
     },
     Parenthesized {
         inner: ExprId,
     },
     Declaration {
-        name: NameId,
+        name: db::Name,
         typ: Option<TypeId>,
         initializer: ExprId,
     },
@@ -53,7 +52,8 @@ pub enum Expr {
         result: Option<ExprId>,
     },
     Block {
-        expressions: Vec<ExprId>,
+        effects: Vec<ExprId>,
+        result: Option<ExprId>,
     },
     Conditional {
         condition: ExprId,
@@ -84,9 +84,9 @@ pub enum Expr {
 }
 
 #[derive(Clone, Debug)]
-pub enum Type {
+pub enum TypeKind {
     Variable {
-        name: NameId,
+        name: db::Name,
     },
     Function {
         parameter_types: Vec<TypeId>,
@@ -95,14 +95,26 @@ pub enum Type {
 }
 
 #[derive(Clone, Debug)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub range: db::Range,
+}
+
+#[derive(Clone, Debug)]
+pub struct Type {
+    pub kind: TypeKind,
+    pub range: db::Range,
+}
+
+#[derive(Clone, Debug)]
 pub struct Parameter {
-    pub name: NameId,
+    pub name: db::Name,
     pub typ: TypeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct Function {
-    pub name: NameId,
+    pub name: db::Name,
     pub parameters: Vec<Parameter>,
     pub return_type: Option<TypeId>,
     pub body: ExprId,
@@ -118,18 +130,10 @@ pub enum TopLevel {
 pub struct Arena {
     pub expr: IndexVec<Expr, ExprId>,
     pub typ: IndexVec<Type, TypeId>,
-    pub name: IndexVec<String, NameId>,
     pub func: IndexVec<Function, FuncId>,
 }
 
 pub struct Module {
     pub top_level: Vec<TopLevel>,
     pub arena: Arena,
-}
-
-impl Arena {
-    pub fn add_name(&mut self, name: &str) -> NameId {
-        let old = self.name.underlying.iter().position(|string| string == name);
-        old.map_or_else(|| self.name.push(String::from(name)), NameId::new)
-    }
 }

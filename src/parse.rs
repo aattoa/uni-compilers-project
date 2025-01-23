@@ -1,7 +1,8 @@
+use crate::ast::{self, Expr, ExprId, ExprKind, Type, TypeId, TypeKind};
+use crate::db::{Diagnostic, Name, Range};
 use crate::lex::{Lexer, Token, TokenKind};
-use crate::{ast, db};
 
-pub type ParseResult<T> = Result<T, db::Diagnostic>;
+pub type ParseResult<T> = Result<T, Diagnostic>;
 
 struct Context<'a> {
     arena: ast::Arena,
@@ -13,35 +14,21 @@ impl<'a> Context<'a> {
     fn new(document: &'a str) -> Self {
         Self { arena: ast::Arena::default(), lexer: Lexer::new(document), document }
     }
-    fn current_range(&mut self) -> db::Range {
-        if let Some(token) = self.lexer.peek() {
-            token.range
-        }
-        else {
-            db::Range::for_position(self.lexer.position())
-        }
+    fn error(&mut self, message: impl Into<String>) -> Diagnostic {
+        Diagnostic::error(self.lexer.current_range(), message)
     }
-    fn error(&mut self, message: impl Into<String>) -> db::Diagnostic {
-        db::Diagnostic::error(self.current_range(), message)
-    }
-    fn expected(&mut self, description: impl std::fmt::Display) -> db::Diagnostic {
+    fn expected(&mut self, description: impl std::fmt::Display) -> Diagnostic {
         let found = self.lexer.peek().map_or("the end of input", |token| token.kind.show());
         self.error(format!("Expected {description}, but found {found}"))
     }
     fn expect(&mut self, kind: TokenKind) -> ParseResult<Token> {
-        if let Some(token) = self.lexer.next_if_kind(kind) {
-            Ok(token)
-        }
-        else {
-            Err(self.expected(kind.show()))
-        }
+        self.lexer.next_if_kind(kind).ok_or_else(|| self.expected(kind.show()))
     }
     fn consume(&mut self, kind: TokenKind) -> bool {
         self.lexer.next_if_kind(kind).is_some()
     }
-    fn name(&mut self, token: Token) -> ast::NameId {
-        debug_assert!(token.kind == TokenKind::Identifier);
-        self.arena.add_name(token.view.string(self.document))
+    fn name(&mut self, token: Token) -> Name {
+        Name { string: token.range.view(self.document).into(), range: token.range }
     }
 }
 
@@ -63,7 +50,7 @@ fn extract_sequence<T>(ctx: &mut Context, elem: impl Parser<T>, desc: &str) -> P
 }
 
 fn is_word(token: Token, word: &str, document: &str) -> bool {
-    token.kind == TokenKind::Identifier && token.view.string(document) == word
+    token.kind == TokenKind::Identifier && token.range.view(document) == word
 }
 
 fn parse_word(ctx: &mut Context, word: &str) -> bool {
@@ -74,49 +61,53 @@ fn extract_word(ctx: &mut Context, word: &str) -> ParseResult<()> {
     if parse_word(ctx, word) { Ok(()) } else { Err(ctx.expected(format!("keyword '{word}'"))) }
 }
 
-fn parse_name(ctx: &mut Context) -> Option<ast::NameId> {
+fn parse_name(ctx: &mut Context) -> Option<Name> {
     ctx.lexer.next_if_kind(TokenKind::Identifier).map(|token| ctx.name(token))
 }
 
-fn extract_name(ctx: &mut Context) -> ParseResult<ast::NameId> {
+fn extract_name(ctx: &mut Context) -> ParseResult<Name> {
     ctx.expect(TokenKind::Identifier).map(|token| ctx.name(token))
 }
 
-fn extract_integer(token: Token, ctx: &mut Context) -> ParseResult<ast::Expr> {
-    match token.view.string(ctx.document).parse() {
-        Ok(literal) => Ok(ast::Expr::Integer { literal }),
-        Err(error) => Err(db::Diagnostic::error(token.range, error.to_string())),
+fn extract_integer(token: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+    match token.range.view(ctx.document).parse() {
+        Ok(literal) => Ok(ExprKind::Integer { literal }),
+        Err(error) => Err(Diagnostic::error(token.range, error.to_string())),
     }
 }
 
-fn extract_block(_open: Token, ctx: &mut Context) -> ParseResult<ast::Expr> {
-    let mut expressions = Vec::new();
+fn extract_block(_open: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+    let mut effects = Vec::new();
+    let mut result = None;
     while let Some(expr) = parse_expr(ctx)? {
-        expressions.push(expr);
-        if !ctx.consume(TokenKind::Semicolon) {
+        if ctx.consume(TokenKind::Semicolon) {
+            effects.push(expr);
+        }
+        else {
+            result = Some(expr);
             break;
         }
     }
     ctx.expect(TokenKind::BraceClose)?;
-    Ok(ast::Expr::Block { expressions })
+    Ok(ExprKind::Block { effects, result })
 }
 
-fn extract_declaration(_var: Token, ctx: &mut Context) -> ParseResult<ast::Expr> {
+fn extract_declaration(_var: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
     let name = extract_name(ctx)?;
     let typ = parse_type_annotation(ctx)?;
     ctx.expect(TokenKind::Equal)?;
     let initializer = extract(ctx, parse_expr, "an initializer")?;
-    Ok(ast::Expr::Declaration { name, typ, initializer })
+    Ok(ExprKind::Declaration { name, typ, initializer })
 }
 
-fn extract_while(_while: Token, ctx: &mut Context) -> ParseResult<ast::Expr> {
+fn extract_while(_while: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
     let condition = extract(ctx, parse_expr, "a condition")?;
     extract_word(ctx, "do")?;
     let body = extract(ctx, parse_expr, "a loop body")?;
-    Ok(ast::Expr::WhileLoop { condition, body })
+    Ok(ExprKind::WhileLoop { condition, body })
 }
 
-fn extract_conditional(_open: Token, ctx: &mut Context) -> ParseResult<ast::Expr> {
+fn extract_conditional(_open: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
     let condition = extract(ctx, parse_expr, "a condition")?;
     extract_word(ctx, "then")?;
     let true_branch = extract(ctx, parse_expr, "the true branch")?;
@@ -126,32 +117,33 @@ fn extract_conditional(_open: Token, ctx: &mut Context) -> ParseResult<ast::Expr
     else {
         None
     };
-    Ok(ast::Expr::Conditional { condition, true_branch, false_branch })
+    Ok(ExprKind::Conditional { condition, true_branch, false_branch })
 }
 
-fn extract_unary(operator: ast::UnaryOp, ctx: &mut Context) -> ParseResult<ast::Expr> {
-    extract(ctx, parse_expr, "an operand").map(|operand| ast::Expr::UnaryCall { operand, operator })
+fn extract_unary(operator: ast::UnaryOp, ctx: &mut Context) -> ParseResult<ExprKind> {
+    let operand = extract(ctx, parse_expr, "an operand")?;
+    Ok(ExprKind::UnaryCall { operand, operator })
 }
 
-fn extract_identifier(token: Token, ctx: &mut Context) -> ParseResult<ast::Expr> {
-    match token.view.string(ctx.document) {
+fn extract_identifier(token: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+    match token.range.view(ctx.document) {
         "var" => extract_declaration(token, ctx),
         "if" => extract_conditional(token, ctx),
         "while" => extract_while(token, ctx),
         "not" => extract_unary(ast::UnaryOp::LogicNot, ctx),
-        "true" => Ok(ast::Expr::Boolean { literal: true }),
-        "false" => Ok(ast::Expr::Boolean { literal: false }),
-        "return" => Ok(ast::Expr::Return { result: parse_expr(ctx)? }),
-        "break" => Ok(ast::Expr::Break { result: parse_expr(ctx)? }),
-        "continue" => Ok(ast::Expr::Continue),
-        name => Ok(ast::Expr::Variable { name: ctx.arena.add_name(name) }),
+        "true" => Ok(ExprKind::Boolean { literal: true }),
+        "false" => Ok(ExprKind::Boolean { literal: false }),
+        "return" => Ok(ExprKind::Return { result: parse_expr(ctx)? }),
+        "break" => Ok(ExprKind::Break { result: parse_expr(ctx)? }),
+        "continue" => Ok(ExprKind::Continue),
+        name => Ok(ExprKind::Variable { name: Name { string: name.into(), range: token.range } }),
     }
 }
 
-fn extract_paren(_open: Token, ctx: &mut Context) -> ParseResult<ast::Expr> {
+fn extract_paren(_open: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
     let inner = extract(ctx, parse_expr, "the inner expression")?;
     ctx.expect(TokenKind::ParenClose)?;
-    Ok(ast::Expr::Parenthesized { inner })
+    Ok(ExprKind::Parenthesized { inner })
 }
 
 fn binary_op(token: Token, ctx: &Context) -> Option<ast::BinaryOp> {
@@ -167,7 +159,7 @@ fn binary_op(token: Token, ctx: &Context) -> Option<ast::BinaryOp> {
         TokenKind::Minus => Some(Subtract),
         TokenKind::Star => Some(Multiply),
         TokenKind::Slash => Some(Divide),
-        TokenKind::Identifier => match token.view.string(ctx.document) {
+        TokenKind::Identifier => match token.range.view(ctx.document) {
             "and" => Some(LogicAnd),
             "or" => Some(LogicOr),
             _ => None,
@@ -176,7 +168,7 @@ fn binary_op(token: Token, ctx: &Context) -> Option<ast::BinaryOp> {
     }
 }
 
-fn parse_normal_expr(ctx: &mut Context) -> ParseResult<Option<ast::Expr>> {
+fn parse_normal_expr(ctx: &mut Context) -> ParseResult<Option<ExprKind>> {
     let Some(token) = ctx.lexer.next()
     else {
         return Ok(None);
@@ -194,6 +186,19 @@ fn parse_normal_expr(ctx: &mut Context) -> ParseResult<Option<ast::Expr>> {
     }
 }
 
+fn parse_potential_function_call(function: Expr, ctx: &mut Context) -> ParseResult<Expr> {
+    if ctx.consume(TokenKind::ParenOpen) {
+        let arguments = extract_sequence(ctx, parse_expr, "a function argument")?;
+        ctx.expect(TokenKind::ParenClose)?;
+        let range = Range { begin: function.range.begin, end: ctx.lexer.current_position() };
+        let kind = ExprKind::FunctionCall { function: ctx.arena.expr.push(function), arguments };
+        parse_potential_function_call(Expr { kind, range }, ctx)
+    }
+    else {
+        Ok(function)
+    }
+}
+
 const OPERATORS: &[&[ast::BinaryOp]] = {
     use ast::BinaryOp::*;
     &[
@@ -206,66 +211,75 @@ const OPERATORS: &[&[ast::BinaryOp]] = {
     ]
 };
 
-fn parse_infix_call(ctx: &mut Context, precedence: usize) -> ParseResult<Option<ast::ExprId>> {
+fn combined_range(ctx: &Context, left: ExprId, right: ExprId) -> Range {
+    Range { begin: ctx.arena.expr[left].range.begin, end: ctx.arena.expr[right].range.end }
+}
+
+fn parse_infix_call(ctx: &mut Context, precedence: usize) -> ParseResult<Option<ExprId>> {
     if precedence == OPERATORS.len() {
-        parse_normal_expr(ctx).map(|expr| expr.map(|expr| ctx.arena.expr.push(expr)))
+        let begin = ctx.lexer.current_position();
+        Ok(if let Some(kind) = parse_normal_expr(ctx)? {
+            let end = ctx.lexer.current_position();
+            let function = Expr { kind, range: Range { begin, end } };
+            let call = parse_potential_function_call(function, ctx)?;
+            Some(ctx.arena.expr.push(call))
+        }
+        else {
+            None
+        })
     }
     else {
-        let mut lhs = parse_infix_call(ctx, precedence + 1)?;
-        if let Some(lhs) = &mut lhs {
-            while let Some(token) = ctx.lexer.next() {
-                if let Some(operator) = binary_op(token, ctx)
-                    && OPERATORS[precedence].contains(&operator)
-                {
-                    let rhs =
-                        extract(ctx, |ctx| parse_infix_call(ctx, precedence + 1), "an operand")?;
-                    *lhs = ctx.arena.expr.push(ast::Expr::InfixCall {
-                        left: *lhs,
-                        right: rhs,
-                        operator,
-                    });
-                }
-                else {
-                    ctx.lexer.unlex(token);
-                    break;
-                }
+        let Some(mut lhs) = parse_infix_call(ctx, precedence + 1)?
+        else {
+            return Ok(None);
+        };
+        while let Some(token) = ctx.lexer.next() {
+            if let Some(operator) = binary_op(token, ctx)
+                && OPERATORS[precedence].contains(&operator)
+            {
+                let rhs = extract(ctx, |ctx| parse_infix_call(ctx, precedence + 1), "an operand")?;
+                let kind = ExprKind::InfixCall { left: lhs, right: rhs, operator };
+                lhs = ctx.arena.expr.push(Expr { kind, range: combined_range(ctx, lhs, rhs) });
+            }
+            else {
+                ctx.lexer.unlex(token);
+                break;
             }
         }
-        Ok(lhs)
+        Ok(Some(lhs))
     }
 }
 
-fn parse_expr(ctx: &mut Context) -> ParseResult<Option<ast::ExprId>> {
-    let lhs = parse_infix_call(ctx, 0)?;
-    if let Some(lhs) = lhs
+fn parse_expr(ctx: &mut Context) -> ParseResult<Option<ExprId>> {
+    let left = parse_infix_call(ctx, 0)?;
+    if let Some(left) = left
         && ctx.consume(TokenKind::Equal)
     {
-        let rhs = extract(ctx, parse_expr, "an operand")?;
-        Ok(Some(ctx.arena.expr.push(ast::Expr::InfixCall {
-            left: lhs,
-            right: rhs,
-            operator: ast::BinaryOp::Assign,
-        })))
+        let right = extract(ctx, parse_expr, "an operand")?;
+        let kind = ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Assign };
+        Ok(Some(ctx.arena.expr.push(Expr { kind, range: combined_range(ctx, left, right) })))
     }
     else {
-        Ok(lhs)
+        Ok(left)
     }
 }
 
-fn extract_function_type(_open: Token, ctx: &mut Context) -> ParseResult<ast::TypeId> {
+fn extract_function_type(open: Token, ctx: &mut Context) -> ParseResult<TypeId> {
     let parameter_types = extract_sequence(ctx, parse_type, "a type")?;
     ctx.expect(TokenKind::ParenClose)?;
     ctx.expect(TokenKind::RightArrow)?;
     let return_type = extract(ctx, parse_type, "a return type")?;
-    Ok(ctx.arena.typ.push(ast::Type::Function { parameter_types, return_type }))
+    let kind = TypeKind::Function { parameter_types, return_type };
+    let range = Range { begin: open.range.begin, end: ctx.lexer.current_position() };
+    Ok(ctx.arena.typ.push(ast::Type { kind, range }))
 }
 
-fn extract_typename(token: Token, ctx: &mut Context) -> ParseResult<ast::TypeId> {
-    let name = ctx.name(token);
-    Ok(ctx.arena.typ.push(ast::Type::Variable { name }))
+fn extract_typename(token: Token, ctx: &mut Context) -> ParseResult<TypeId> {
+    let kind = TypeKind::Variable { name: ctx.name(token) };
+    Ok(ctx.arena.typ.push(Type { kind, range: token.range }))
 }
 
-fn parse_type(ctx: &mut Context) -> ParseResult<Option<ast::TypeId>> {
+fn parse_type(ctx: &mut Context) -> ParseResult<Option<TypeId>> {
     let Some(token) = ctx.lexer.next()
     else {
         return Ok(None);
@@ -280,7 +294,7 @@ fn parse_type(ctx: &mut Context) -> ParseResult<Option<ast::TypeId>> {
     }
 }
 
-fn parse_type_annotation(ctx: &mut Context) -> ParseResult<Option<ast::TypeId>> {
+fn parse_type_annotation(ctx: &mut Context) -> ParseResult<Option<TypeId>> {
     if ctx.consume(TokenKind::Colon) {
         extract(ctx, parse_type, "a type").map(Some)
     }
@@ -290,13 +304,13 @@ fn parse_type_annotation(ctx: &mut Context) -> ParseResult<Option<ast::TypeId>> 
 }
 
 fn parse_parameter(ctx: &mut Context) -> ParseResult<Option<ast::Parameter>> {
-    if let Some(name) = parse_name(ctx) {
-        extract(ctx, parse_type_annotation, "a type annotation")
-            .map(|typ| Some(ast::Parameter { name, typ }))
+    Ok(if let Some(name) = parse_name(ctx) {
+        let typ = extract(ctx, parse_type_annotation, "a type annotation")?;
+        Some(ast::Parameter { name, typ })
     }
     else {
-        Ok(None)
-    }
+        None
+    })
 }
 
 fn extract_function(ctx: &mut Context) -> ParseResult<ast::Function> {
@@ -305,8 +319,11 @@ fn extract_function(ctx: &mut Context) -> ParseResult<ast::Function> {
     let parameters = extract_sequence(ctx, parse_parameter, "a parameter")?;
     ctx.expect(TokenKind::ParenClose)?;
     let return_type = parse_type_annotation(ctx)?;
-    let body = extract_block(ctx.expect(TokenKind::BraceOpen)?, ctx)?;
-    Ok(ast::Function { name, parameters, return_type, body: ctx.arena.expr.push(body) })
+    let open = ctx.expect(TokenKind::BraceOpen)?;
+    let kind = extract_block(open, ctx)?;
+    let range = Range { begin: open.range.begin, end: ctx.lexer.current_position() };
+    let body = ctx.arena.expr.push(Expr { kind, range });
+    Ok(ast::Function { name, parameters, return_type, body })
 }
 
 fn parse_top_level(ctx: &mut Context) -> ParseResult<Option<ast::TopLevel>> {
@@ -338,25 +355,24 @@ mod tests {
     use super::*;
     use crate::assert_let;
 
-    fn assert_name(arena: &ast::Arena, expr: ast::ExprId, str: &str) {
-        assert_let!(ast::Expr::Variable { name } = arena.expr[expr]);
-        assert_eq!(arena.name[name], str);
+    fn assert_name(arena: &ast::Arena, expr: ExprId, str: &str) {
+        assert_let!(ExprKind::Variable { name } = &arena.expr[expr].kind);
+        assert_eq!(name.string, str);
     }
-    fn assert_typename(arena: &ast::Arena, typ: ast::TypeId, str: &str) {
-        assert_let!(ast::Type::Variable { name } = arena.typ[typ]);
-        assert_eq!(arena.name[name], str);
+    fn assert_typename(arena: &ast::Arena, typ: TypeId, str: &str) {
+        assert_let!(TypeKind::Variable { name } = &arena.typ[typ].kind);
+        assert_eq!(name.string, str);
     }
-
-    fn top_level_expr<'a>(top_level: &'a [ast::TopLevel], arena: &'a ast::Arena) -> &'a ast::Expr {
+    fn top_level_expr<'a>(top_level: &[ast::TopLevel], arena: &'a ast::Arena) -> &'a ExprKind {
         assert_let!([ast::TopLevel::Expr(expr_id)] = top_level);
-        &arena.expr[*expr_id]
+        &arena.expr[*expr_id].kind
     }
 
     #[test]
     fn conditional() {
         let ast::Module { top_level, arena } = parse("if a then b else c").unwrap();
         assert_let!(
-            ast::Expr::Conditional { condition, true_branch, false_branch } =
+            ExprKind::Conditional { condition, true_branch, false_branch } =
                 top_level_expr(&top_level, &arena)
         );
         assert_name(&arena, *condition, "a");
@@ -368,22 +384,23 @@ mod tests {
     fn declaration() {
         let ast::Module { top_level, arena } = parse("var a: (A, B) => C = b").unwrap();
         assert_let!(
-            ast::Expr::Declaration { name, typ, initializer } = top_level_expr(&top_level, &arena)
+            ExprKind::Declaration { name, typ, initializer } = top_level_expr(&top_level, &arena)
         );
-        assert_eq!(arena.name[*name], "a");
+        assert_eq!(name.string, "a");
         assert_name(&arena, *initializer, "b");
-        assert_let!(ast::Type::Function { ref parameter_types, return_type } =
-            arena.typ[typ.unwrap()]);
+        assert_let!(
+            TypeKind::Function { parameter_types, return_type } = &arena.typ[typ.unwrap()].kind
+        );
         assert_eq!(parameter_types.len(), 2);
         assert_typename(&arena, parameter_types[0], "A");
         assert_typename(&arena, parameter_types[1], "B");
-        assert_typename(&arena, return_type, "C");
+        assert_typename(&arena, *return_type, "C");
     }
 
     #[test]
     fn while_loop() {
         let ast::Module { top_level, arena } = parse("while a do b").unwrap();
-        assert_let!(ast::Expr::WhileLoop { condition, body } = top_level_expr(&top_level, &arena));
+        assert_let!(ExprKind::WhileLoop { condition, body } = top_level_expr(&top_level, &arena));
         assert_name(&arena, *condition, "a");
         assert_name(&arena, *body, "b");
     }
@@ -394,24 +411,26 @@ mod tests {
             let ast::Module { top_level, arena } = parse("a + b * c or d and e - f").unwrap(); // ((a + (b * c)) or (d and (e - f)))
 
             assert_let!(
-                ast::Expr::InfixCall { left, right, operator: ast::BinaryOp::LogicOr } =
+                ExprKind::InfixCall { left, right, operator: ast::BinaryOp::LogicOr } =
                     top_level_expr(&top_level, &arena)
             );
 
             {
-                assert_let!(ast::Expr::InfixCall { left, right, operator } = arena.expr[*left]);
+                assert_let!(ExprKind::InfixCall { left, right, operator } = arena.expr[*left].kind);
                 assert_eq!(operator, ast::BinaryOp::Add);
                 assert_name(&arena, left, "a");
-                assert_let!(ast::Expr::InfixCall { left, right, operator } = arena.expr[right]);
+                assert_let!(ExprKind::InfixCall { left, right, operator } = arena.expr[right].kind);
                 assert_eq!(operator, ast::BinaryOp::Multiply);
                 assert_name(&arena, left, "b");
                 assert_name(&arena, right, "c");
             }
             {
-                assert_let!(ast::Expr::InfixCall { left, right, operator } = arena.expr[*right]);
+                assert_let!(
+                    ExprKind::InfixCall { left, right, operator } = arena.expr[*right].kind
+                );
                 assert_eq!(operator, ast::BinaryOp::LogicAnd);
                 assert_name(&arena, left, "d");
-                assert_let!(ast::Expr::InfixCall { left, right, operator } = arena.expr[right]);
+                assert_let!(ExprKind::InfixCall { left, right, operator } = arena.expr[right].kind);
                 assert_eq!(operator, ast::BinaryOp::Subtract);
                 assert_name(&arena, left, "e");
                 assert_name(&arena, right, "f");
@@ -419,15 +438,15 @@ mod tests {
         }
         {
             let ast::Module { top_level, arena } = parse("return a - b + c").unwrap(); // (return ((a - b) + c))
-            assert_let!(ast::Expr::Return { result } = top_level_expr(&top_level, &arena));
+            assert_let!(ExprKind::Return { result } = top_level_expr(&top_level, &arena));
             assert_let!(
-                ast::Expr::InfixCall { left, right, operator: ast::BinaryOp::Add } =
-                    arena.expr[result.unwrap()]
+                ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Add } =
+                    arena.expr[result.unwrap()].kind
             );
             assert_name(&arena, right, "c");
             assert_let!(
-                ast::Expr::InfixCall { left, right, operator: ast::BinaryOp::Subtract } =
-                    arena.expr[left]
+                ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Subtract } =
+                    arena.expr[left].kind
             );
             assert_name(&arena, left, "a");
             assert_name(&arena, right, "b");
@@ -435,14 +454,14 @@ mod tests {
         {
             let ast::Module { top_level, arena } = parse("(a + b) * c").unwrap();
             assert_let!(
-                ast::Expr::InfixCall { left, right, operator: ast::BinaryOp::Multiply } =
+                ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Multiply } =
                     top_level_expr(&top_level, &arena)
             );
             assert_name(&arena, *right, "c");
-            assert_let!(ast::Expr::Parenthesized { inner } = arena.expr[*left]);
+            assert_let!(ExprKind::Parenthesized { inner } = arena.expr[*left].kind);
             assert_let!(
-                ast::Expr::InfixCall { left, right, operator: ast::BinaryOp::Add } =
-                    arena.expr[inner]
+                ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Add } =
+                    arena.expr[inner].kind
             );
             assert_name(&arena, left, "a");
             assert_name(&arena, right, "b");
@@ -450,23 +469,23 @@ mod tests {
         {
             let ast::Module { top_level, arena } = parse("a = b = c * d + e").unwrap(); // (a = (b = ((c * d) + e)))
             assert_let!(
-                ast::Expr::InfixCall { left, right, operator: ast::BinaryOp::Assign } =
+                ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Assign } =
                     top_level_expr(&top_level, &arena)
             );
             assert_name(&arena, *left, "a");
             assert_let!(
-                ast::Expr::InfixCall { left, right, operator: ast::BinaryOp::Assign } =
-                    arena.expr[*right]
+                ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Assign } =
+                    arena.expr[*right].kind
             );
             assert_name(&arena, left, "b");
             assert_let!(
-                ast::Expr::InfixCall { left, right, operator: ast::BinaryOp::Add } =
-                    arena.expr[right]
+                ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Add } =
+                    arena.expr[right].kind
             );
             assert_name(&arena, right, "e");
             assert_let!(
-                ast::Expr::InfixCall { left, right, operator: ast::BinaryOp::Multiply } =
-                    arena.expr[left]
+                ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Multiply } =
+                    arena.expr[left].kind
             );
             assert_name(&arena, left, "c");
             assert_name(&arena, right, "d");
@@ -474,20 +493,54 @@ mod tests {
     }
 
     #[test]
-    fn function() {
-        let ast::Module { top_level, arena } = parse("fun id(x: T): R { return x }").unwrap();
+    fn function_call() {
+        {
+            let ast::Module { top_level, arena } = parse("f(a, b, c)").unwrap();
+            assert_let!(
+                ExprKind::FunctionCall { function, arguments } = top_level_expr(&top_level, &arena)
+            );
+            assert_let!([a, b, c] = arguments.as_slice());
+            assert_name(&arena, *function, "f");
+            assert_name(&arena, *a, "a");
+            assert_name(&arena, *b, "b");
+            assert_name(&arena, *c, "c");
+        }
+        {
+            let ast::Module { top_level, arena } = parse("-f(a)(b)").unwrap();
+            assert_let!(
+                ExprKind::UnaryCall { operand, operator: ast::UnaryOp::Negate } =
+                    top_level_expr(&top_level, &arena)
+            );
+            assert_let!(
+                ExprKind::FunctionCall { function, arguments } = &arena.expr[*operand].kind
+            );
+            assert_let!([b] = arguments.as_slice());
+            assert_let!(
+                ExprKind::FunctionCall { function, arguments } = &arena.expr[*function].kind
+            );
+            assert_let!([a] = arguments.as_slice());
+            assert_name(&arena, *function, "f");
+            assert_name(&arena, *a, "a");
+            assert_name(&arena, *b, "b");
+        }
+    }
+
+    #[test]
+    fn function_definition() {
+        let ast::Module { top_level, arena } = parse("fun id(x: T): R { x; y; z }").unwrap();
         assert_let!([ast::TopLevel::Func(func_id)] = top_level.as_slice());
         let ast::Function { name, parameters, return_type, body } = &arena.func[*func_id];
-        assert_eq!(arena.name[*name], "id");
+        assert_eq!(name.string, "id");
         assert_typename(&arena, return_type.unwrap(), "R");
 
         assert_let!([ast::Parameter { name, typ }] = parameters.as_slice());
-        assert_eq!(arena.name[*name], "x");
+        assert_eq!(name.string, "x");
         assert_typename(&arena, *typ, "T");
 
-        assert_let!(ast::Expr::Block { expressions } = &arena.expr[*body]);
-        assert_let!([return_id] = expressions.as_slice());
-        assert_let!(ast::Expr::Return { result } = arena.expr[*return_id]);
-        assert_name(&arena, result.unwrap(), "x");
+        assert_let!(ExprKind::Block { effects, result } = &arena.expr[*body].kind);
+        assert_let!([x, y] = effects.as_slice());
+        assert_name(&arena, *x, "x");
+        assert_name(&arena, *y, "y");
+        assert_name(&arena, result.unwrap(), "z");
     }
 }

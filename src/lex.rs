@@ -31,7 +31,6 @@ pub enum TokenKind {
 #[derive(Clone, Copy, Debug)]
 pub struct Token {
     pub kind: TokenKind,
-    pub view: db::View,
     pub range: db::Range,
 }
 
@@ -97,14 +96,10 @@ fn skip_trivia(chars: &mut PosChars) {
 
 fn lex(chars: &mut PosChars) -> Option<Token> {
     skip_trivia(chars);
-    let (o1, p1) = (chars.offset, chars.position);
+    let begin = chars.position;
     let kind = next_token(chars.next()?, chars);
-    let (o2, p2) = (chars.offset, chars.position);
-    Some(Token {
-        kind,
-        view: db::View { begin: o1, end: o2 },
-        range: db::Range { begin: p1, end: p2 },
-    })
+    let end = chars.position;
+    Some(Token { kind, range: db::Range { begin, end } })
 }
 
 impl<'a> Iterator for Lexer<'a> {
@@ -118,9 +113,6 @@ impl<'a> Lexer<'a> {
     pub fn new(document: &'a str) -> Self {
         Self { chars: PosChars::new(document), next: None }
     }
-    pub fn position(&self) -> db::Position {
-        self.chars.position
-    }
     pub fn peek(&mut self) -> Option<Token> {
         if self.next.is_none() {
             self.next = lex(&mut self.chars);
@@ -128,10 +120,7 @@ impl<'a> Lexer<'a> {
         self.next
     }
     pub fn next_if(&mut self, predicate: impl FnOnce(Token) -> bool) -> Option<Token> {
-        match self.peek() {
-            Some(token) if predicate(token) => self.next(),
-            _ => None,
-        }
+        if self.peek().is_some_and(predicate) { self.next() } else { None }
     }
     pub fn next_if_kind(&mut self, kind: TokenKind) -> Option<Token> {
         self.next_if(|token| token.kind == kind)
@@ -139,6 +128,13 @@ impl<'a> Lexer<'a> {
     pub fn unlex(&mut self, token: Token) {
         assert!(self.next.is_none());
         self.next = Some(token);
+    }
+    pub fn current_range(&mut self) -> db::Range {
+        self.peek()
+            .map_or_else(|| db::Range::for_position(self.chars.position), |token| token.range)
+    }
+    pub fn current_position(&mut self) -> db::Position {
+        self.peek().map_or(self.chars.position, |token| token.range.begin)
     }
 }
 
@@ -183,27 +179,27 @@ mod tests {
 
         let token = lexer.next().unwrap();
         assert_eq!(token.kind, TokenKind::Identifier);
-        assert_eq!(token.view.string(document), "if");
-        assert_eq!(token.range.begin, db::Position { line: 0, character: 0 });
-        assert_eq!(token.range.end, db::Position { line: 0, character: 2 });
+        assert_eq!(token.range.view(document), "if");
+        assert_eq!(token.range.begin, db::Position { line: 0, character: 0, offset: 0 });
+        assert_eq!(token.range.end, db::Position { line: 0, character: 2, offset: 2 });
 
         let token = lexer.next().unwrap();
         assert_eq!(token.kind, TokenKind::Integer);
-        assert_eq!(token.view.string(document), "3");
-        assert_eq!(token.range.begin, db::Position { line: 0, character: 4 });
-        assert_eq!(token.range.end, db::Position { line: 0, character: 5 });
+        assert_eq!(token.range.view(document), "3");
+        assert_eq!(token.range.begin, db::Position { line: 0, character: 4, offset: 4 });
+        assert_eq!(token.range.end, db::Position { line: 0, character: 5, offset: 5 });
 
         let token = lexer.next().unwrap();
         assert_eq!(token.kind, TokenKind::Identifier);
-        assert_eq!(token.view.string(document), "while");
-        assert_eq!(token.range.begin, db::Position { line: 1, character: 0 });
-        assert_eq!(token.range.end, db::Position { line: 1, character: 5 });
+        assert_eq!(token.range.view(document), "while");
+        assert_eq!(token.range.begin, db::Position { line: 1, character: 0, offset: 6 });
+        assert_eq!(token.range.end, db::Position { line: 1, character: 5, offset: 11 });
 
         assert!(lexer.next().is_none());
     }
 
     fn token_strings(document: &str) -> Vec<&str> {
-        Lexer::new(document).map(|token| token.view.string(document)).collect()
+        Lexer::new(document).map(|token| token.range.view(document)).collect()
     }
 
     #[test]

@@ -2,18 +2,13 @@
 pub struct Position {
     pub line: u32,
     pub character: u32,
+    pub offset: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Range {
     pub begin: Position,
     pub end: Position,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct View {
-    pub begin: u32,
-    pub end: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,16 +26,10 @@ pub struct Diagnostic {
     pub severity: Severity,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Ranged<T> {
-    pub value: T,
+#[derive(Clone, Debug)]
+pub struct Name {
+    pub string: String,
     pub range: Range,
-}
-
-impl View {
-    pub fn string(self, str: &str) -> &str {
-        &str[(self.begin as usize)..(self.end as usize)]
-    }
 }
 
 impl Position {
@@ -52,12 +41,16 @@ impl Position {
         else {
             self.character += 1;
         }
+        self.offset += char.len_utf8() as u32;
     }
 }
 
 impl Range {
     pub fn for_position(begin: Position) -> Self {
         Self { begin, end: Position { character: begin.character + 1, ..begin } }
+    }
+    pub fn view<'a>(&self, str: &'a str) -> &'a str {
+        &str[(self.begin.offset as usize)..(self.end.offset as usize)]
     }
 }
 
