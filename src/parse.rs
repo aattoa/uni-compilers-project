@@ -1,8 +1,6 @@
 use crate::ast::{self, Expr, ExprId, ExprKind, Type, TypeId, TypeKind};
-use crate::db::{Diagnostic, Name, Range};
+use crate::db::{self, Diagnostic, Name, Range};
 use crate::lex::{Lexer, Token, TokenKind};
-
-pub type ParseResult<T> = Result<T, Diagnostic>;
 
 struct Context<'a> {
     arena: ast::Arena,
@@ -21,7 +19,7 @@ impl<'a> Context<'a> {
         let found = self.lexer.peek().map_or("the end of input", |token| token.kind.show());
         self.error(format!("Expected {description}, but found {found}"))
     }
-    fn expect(&mut self, kind: TokenKind) -> ParseResult<Token> {
+    fn expect(&mut self, kind: TokenKind) -> db::Result<Token> {
         self.lexer.next_if_kind(kind).ok_or_else(|| self.expected(kind.show()))
     }
     fn consume(&mut self, kind: TokenKind) -> bool {
@@ -32,13 +30,13 @@ impl<'a> Context<'a> {
     }
 }
 
-trait Parser<T> = Fn(&mut Context) -> ParseResult<Option<T>>;
+trait Parser<T> = Fn(&mut Context) -> db::Result<Option<T>>;
 
-fn extract<T>(ctx: &mut Context, parser: impl Parser<T>, desc: &str) -> ParseResult<T> {
+fn extract<T>(ctx: &mut Context, parser: impl Parser<T>, desc: &str) -> db::Result<T> {
     parser(ctx)?.ok_or_else(|| ctx.expected(desc))
 }
 
-fn extract_sequence<T>(ctx: &mut Context, elem: impl Parser<T>, desc: &str) -> ParseResult<Vec<T>> {
+fn extract_sequence<T>(ctx: &mut Context, elem: impl Parser<T>, desc: &str) -> db::Result<Vec<T>> {
     let mut vec = Vec::new();
     if let Some(head) = elem(ctx)? {
         vec.push(head);
@@ -57,7 +55,7 @@ fn parse_word(ctx: &mut Context, word: &str) -> bool {
     ctx.lexer.next_if(|token| is_word(token, word, ctx.document)).is_some()
 }
 
-fn extract_word(ctx: &mut Context, word: &str) -> ParseResult<()> {
+fn extract_word(ctx: &mut Context, word: &str) -> db::Result<()> {
     if parse_word(ctx, word) { Ok(()) } else { Err(ctx.expected(format!("keyword '{word}'"))) }
 }
 
@@ -65,18 +63,18 @@ fn parse_name(ctx: &mut Context) -> Option<Name> {
     ctx.lexer.next_if_kind(TokenKind::Identifier).map(|token| ctx.name(token))
 }
 
-fn extract_name(ctx: &mut Context) -> ParseResult<Name> {
+fn extract_name(ctx: &mut Context) -> db::Result<Name> {
     ctx.expect(TokenKind::Identifier).map(|token| ctx.name(token))
 }
 
-fn extract_integer(token: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+fn extract_integer(token: Token, ctx: &mut Context) -> db::Result<ExprKind> {
     match token.range.view(ctx.document).parse() {
         Ok(literal) => Ok(ExprKind::Integer { literal }),
         Err(error) => Err(Diagnostic::error(token.range, error.to_string())),
     }
 }
 
-fn extract_block(_open: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+fn extract_block(_open: Token, ctx: &mut Context) -> db::Result<ExprKind> {
     let mut effects = Vec::new();
     let mut result = None;
     while let Some(expr) = parse_expr(ctx)? {
@@ -92,7 +90,7 @@ fn extract_block(_open: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
     Ok(ExprKind::Block { effects, result })
 }
 
-fn extract_declaration(_var: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+fn extract_declaration(_var: Token, ctx: &mut Context) -> db::Result<ExprKind> {
     let name = extract_name(ctx)?;
     let typ = parse_type_annotation(ctx)?;
     ctx.expect(TokenKind::Equal)?;
@@ -100,14 +98,14 @@ fn extract_declaration(_var: Token, ctx: &mut Context) -> ParseResult<ExprKind> 
     Ok(ExprKind::Declaration { name, typ, initializer })
 }
 
-fn extract_while(_while: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+fn extract_while(_while: Token, ctx: &mut Context) -> db::Result<ExprKind> {
     let condition = extract(ctx, parse_expr, "a condition")?;
     extract_word(ctx, "do")?;
     let body = extract(ctx, parse_expr, "a loop body")?;
     Ok(ExprKind::WhileLoop { condition, body })
 }
 
-fn extract_conditional(_open: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+fn extract_conditional(_open: Token, ctx: &mut Context) -> db::Result<ExprKind> {
     let condition = extract(ctx, parse_expr, "a condition")?;
     extract_word(ctx, "then")?;
     let true_branch = extract(ctx, parse_expr, "the true branch")?;
@@ -120,12 +118,12 @@ fn extract_conditional(_open: Token, ctx: &mut Context) -> ParseResult<ExprKind>
     Ok(ExprKind::Conditional { condition, true_branch, false_branch })
 }
 
-fn extract_unary(operator: ast::UnaryOp, ctx: &mut Context) -> ParseResult<ExprKind> {
+fn extract_unary(operator: ast::UnaryOp, ctx: &mut Context) -> db::Result<ExprKind> {
     let operand = extract(ctx, parse_expr, "an operand")?;
     Ok(ExprKind::UnaryCall { operand, operator })
 }
 
-fn extract_identifier(token: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+fn extract_identifier(token: Token, ctx: &mut Context) -> db::Result<ExprKind> {
     match token.range.view(ctx.document) {
         "var" => extract_declaration(token, ctx),
         "if" => extract_conditional(token, ctx),
@@ -136,11 +134,12 @@ fn extract_identifier(token: Token, ctx: &mut Context) -> ParseResult<ExprKind> 
         "return" => Ok(ExprKind::Return { result: parse_expr(ctx)? }),
         "break" => Ok(ExprKind::Break { result: parse_expr(ctx)? }),
         "continue" => Ok(ExprKind::Continue),
+        "new" | "delete" => Err(db::Diagnostic::error(token.range, "Unsupported expression")),
         name => Ok(ExprKind::Variable { name: Name { string: name.into(), range: token.range } }),
     }
 }
 
-fn extract_paren(_open: Token, ctx: &mut Context) -> ParseResult<ExprKind> {
+fn extract_paren(_open: Token, ctx: &mut Context) -> db::Result<ExprKind> {
     let inner = extract(ctx, parse_expr, "the inner expression")?;
     ctx.expect(TokenKind::ParenClose)?;
     Ok(ExprKind::Parenthesized { inner })
@@ -168,7 +167,7 @@ fn binary_op(token: Token, ctx: &Context) -> Option<ast::BinaryOp> {
     }
 }
 
-fn parse_normal_expr(ctx: &mut Context) -> ParseResult<Option<ExprKind>> {
+fn parse_normal_expr(ctx: &mut Context) -> db::Result<Option<ExprKind>> {
     let Some(token) = ctx.lexer.next()
     else {
         return Ok(None);
@@ -186,7 +185,7 @@ fn parse_normal_expr(ctx: &mut Context) -> ParseResult<Option<ExprKind>> {
     }
 }
 
-fn parse_potential_function_call(function: Expr, ctx: &mut Context) -> ParseResult<Expr> {
+fn parse_potential_function_call(function: Expr, ctx: &mut Context) -> db::Result<Expr> {
     if ctx.consume(TokenKind::ParenOpen) {
         let arguments = extract_sequence(ctx, parse_expr, "a function argument")?;
         ctx.expect(TokenKind::ParenClose)?;
@@ -215,7 +214,7 @@ fn combined_range(ctx: &Context, left: ExprId, right: ExprId) -> Range {
     Range { begin: ctx.arena.expr[left].range.begin, end: ctx.arena.expr[right].range.end }
 }
 
-fn parse_infix_call(ctx: &mut Context, precedence: usize) -> ParseResult<Option<ExprId>> {
+fn parse_infix_call(ctx: &mut Context, precedence: usize) -> db::Result<Option<ExprId>> {
     if precedence == OPERATORS.len() {
         let begin = ctx.lexer.current_position();
         Ok(if let Some(kind) = parse_normal_expr(ctx)? {
@@ -250,7 +249,7 @@ fn parse_infix_call(ctx: &mut Context, precedence: usize) -> ParseResult<Option<
     }
 }
 
-fn parse_expr(ctx: &mut Context) -> ParseResult<Option<ExprId>> {
+fn parse_expr(ctx: &mut Context) -> db::Result<Option<ExprId>> {
     let left = parse_infix_call(ctx, 0)?;
     if let Some(left) = left
         && ctx.consume(TokenKind::Equal)
@@ -264,22 +263,21 @@ fn parse_expr(ctx: &mut Context) -> ParseResult<Option<ExprId>> {
     }
 }
 
-fn extract_function_type(open: Token, ctx: &mut Context) -> ParseResult<TypeId> {
-    let parameter_types = extract_sequence(ctx, parse_type, "a type")?;
+fn extract_function_type(open: Token, ctx: &mut Context) -> db::Result<TypeId> {
+    let params = extract_sequence(ctx, parse_type, "a type")?;
     ctx.expect(TokenKind::ParenClose)?;
     ctx.expect(TokenKind::RightArrow)?;
-    let return_type = extract(ctx, parse_type, "a return type")?;
-    let kind = TypeKind::Function { parameter_types, return_type };
+    let kind = TypeKind::Function { params, ret: extract(ctx, parse_type, "a return type")? };
     let range = Range { begin: open.range.begin, end: ctx.lexer.current_position() };
     Ok(ctx.arena.typ.push(ast::Type { kind, range }))
 }
 
-fn extract_typename(token: Token, ctx: &mut Context) -> ParseResult<TypeId> {
+fn extract_typename(token: Token, ctx: &mut Context) -> db::Result<TypeId> {
     let kind = TypeKind::Variable { name: ctx.name(token) };
     Ok(ctx.arena.typ.push(Type { kind, range: token.range }))
 }
 
-fn parse_type(ctx: &mut Context) -> ParseResult<Option<TypeId>> {
+fn parse_type(ctx: &mut Context) -> db::Result<Option<TypeId>> {
     let Some(token) = ctx.lexer.next()
     else {
         return Ok(None);
@@ -294,7 +292,7 @@ fn parse_type(ctx: &mut Context) -> ParseResult<Option<TypeId>> {
     }
 }
 
-fn parse_type_annotation(ctx: &mut Context) -> ParseResult<Option<TypeId>> {
+fn parse_type_annotation(ctx: &mut Context) -> db::Result<Option<TypeId>> {
     if ctx.consume(TokenKind::Colon) {
         extract(ctx, parse_type, "a type").map(Some)
     }
@@ -303,7 +301,7 @@ fn parse_type_annotation(ctx: &mut Context) -> ParseResult<Option<TypeId>> {
     }
 }
 
-fn parse_parameter(ctx: &mut Context) -> ParseResult<Option<ast::Parameter>> {
+fn parse_parameter(ctx: &mut Context) -> db::Result<Option<ast::Parameter>> {
     Ok(if let Some(name) = parse_name(ctx) {
         let typ = extract(ctx, parse_type_annotation, "a type annotation")?;
         Some(ast::Parameter { name, typ })
@@ -313,7 +311,7 @@ fn parse_parameter(ctx: &mut Context) -> ParseResult<Option<ast::Parameter>> {
     })
 }
 
-fn extract_function(ctx: &mut Context) -> ParseResult<ast::Function> {
+fn extract_function(ctx: &mut Context) -> db::Result<ast::Function> {
     let name = extract_name(ctx)?;
     ctx.expect(TokenKind::ParenOpen)?;
     let parameters = extract_sequence(ctx, parse_parameter, "a parameter")?;
@@ -326,7 +324,7 @@ fn extract_function(ctx: &mut Context) -> ParseResult<ast::Function> {
     Ok(ast::Function { name, parameters, return_type, body })
 }
 
-fn parse_top_level(ctx: &mut Context) -> ParseResult<Option<ast::TopLevel>> {
+fn parse_top_level(ctx: &mut Context) -> db::Result<Option<ast::TopLevel>> {
     if parse_word(ctx, "fun") {
         extract_function(ctx).map(|func| Some(ast::TopLevel::Func(ctx.arena.func.push(func))))
     }
@@ -335,7 +333,7 @@ fn parse_top_level(ctx: &mut Context) -> ParseResult<Option<ast::TopLevel>> {
     }
 }
 
-pub fn parse(document: &str) -> ParseResult<ast::Module> {
+pub fn parse(document: &str) -> db::Result<ast::Module> {
     let mut ctx = Context::new(document);
     let mut top_level = Vec::new();
     while let Some(item) = parse_top_level(&mut ctx)? {
@@ -388,13 +386,11 @@ mod tests {
         );
         assert_eq!(name.string, "a");
         assert_name(&arena, *initializer, "b");
-        assert_let!(
-            TypeKind::Function { parameter_types, return_type } = &arena.typ[typ.unwrap()].kind
-        );
-        assert_eq!(parameter_types.len(), 2);
-        assert_typename(&arena, parameter_types[0], "A");
-        assert_typename(&arena, parameter_types[1], "B");
-        assert_typename(&arena, *return_type, "C");
+        assert_let!(TypeKind::Function { params, ret } = &arena.typ[typ.unwrap()].kind);
+        assert_eq!(params.len(), 2);
+        assert_typename(&arena, params[0], "A");
+        assert_typename(&arena, params[1], "B");
+        assert_typename(&arena, *ret, "C");
     }
 
     #[test]

@@ -85,13 +85,8 @@ pub enum ExprKind {
 
 #[derive(Clone, Debug)]
 pub enum TypeKind {
-    Variable {
-        name: db::Name,
-    },
-    Function {
-        parameter_types: Vec<TypeId>,
-        return_type: TypeId,
-    },
+    Variable { name: db::Name },
+    Function { params: Vec<TypeId>, ret: TypeId },
 }
 
 #[derive(Clone, Debug)]
