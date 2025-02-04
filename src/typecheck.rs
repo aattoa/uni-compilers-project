@@ -18,6 +18,7 @@ struct ScopeLayer {
     diverged: bool,
 }
 
+#[derive(Default)]
 struct Scope {
     stack: Vec<ScopeLayer>,
 }
@@ -26,14 +27,21 @@ struct Context {
     arena: ir::Arena,
     constants: ir::Constants,
     diagnostics: Vec<db::Diagnostic>,
+    current_label: usize,
+}
+
+impl ScopeLayer {
+    fn bind(&mut self, name: db::Name, var_id: ir::VarId) {
+        self.bindings.push(Binding { name, var_id, used: false });
+    }
 }
 
 impl Scope {
     fn top(&mut self) -> &mut ScopeLayer {
         self.stack.last_mut().unwrap()
     }
-    fn bind(&mut self, name: db::Name, var_id: ir::VarId) {
-        self.top().bindings.push(Binding { name, var_id, used: false });
+    fn bottom(&mut self) -> &mut ScopeLayer {
+        self.stack.first_mut().unwrap()
     }
 }
 
@@ -41,7 +49,17 @@ impl Context {
     fn new() -> Self {
         let mut arena = ir::Arena::default();
         let constants = ir::Constants::new(&mut arena);
-        Self { arena, constants, diagnostics: Vec::new() }
+        Self { arena, constants, diagnostics: Vec::new(), current_label: 0 }
+    }
+    fn label(&mut self) -> ir::Label {
+        let index = self.current_label;
+        self.current_label += 1;
+        ir::Label { index }
+    }
+    fn var(&mut self, ir: &mut ir::Function, typ: ir::TypeId) -> ir::VarId {
+        let var = ir::Variable { typ, frame_offset: Some(ir.locals_space) };
+        ir.locals_space += self.arena.typ[typ].size_bytes();
+        self.arena.var.push(var)
     }
 }
 
@@ -99,11 +117,11 @@ fn expect_type_eq(
 }
 
 fn expect_unit(ctx: &mut Context, range: db::Range, variable: ir::VarId) -> db::Result<()> {
-    expect_type_eq(ctx, range, ctx.constants.unit_type, ctx.arena.var[variable])
+    expect_type_eq(ctx, range, ctx.constants.unit_type, ctx.arena.var[variable].typ)
 }
 
 fn expect_boolean(ctx: &mut Context, range: db::Range, variable: ir::VarId) -> db::Result<()> {
-    expect_type_eq(ctx, range, ctx.constants.boolean_type, ctx.arena.var[variable])
+    expect_type_eq(ctx, range, ctx.constants.boolean_type, ctx.arena.var[variable].typ)
 }
 
 fn lookup_variable(scope: &mut Scope, name: &db::Name) -> db::Result<ir::VarId> {
@@ -126,7 +144,12 @@ fn unused_variable_warnings(layer: &ScopeLayer) -> impl Iterator<Item = db::Diag
 }
 
 fn never_var(ctx: &mut Context) -> ir::VarId {
-    ctx.arena.var.push(ctx.arena.typ.push(ir::Type::Never))
+    ctx.arena.var.push(ir::Variable::builtin(ctx.arena.typ.push(ir::Type::Never)))
+}
+
+fn diverge(ctx: &mut Context, scope: &mut Scope) -> ir::VarId {
+    scope.top().diverged = true;
+    never_var(ctx)
 }
 
 fn write(ir: &mut ir::Function, range: db::Range, kind: InstrKind) -> usize {
@@ -139,11 +162,28 @@ fn patch(ir: &mut ir::Function, offset: usize, kind: InstrKind) {
     ir.instructions[offset].kind = kind;
 }
 
+#[derive(Default)]
+struct LoopInfo {
+    break_offsets: Vec<usize>,
+    continue_offsets: Vec<usize>,
+}
+
+fn with_scope<T>(
+    scope: &mut Scope,
+    callback: impl FnOnce(&mut Scope) -> db::Result<T>,
+) -> db::Result<(T, ScopeLayer)> {
+    scope.stack.push(ScopeLayer::default());
+    let result = callback(scope)?;
+    let layer = scope.stack.pop().unwrap();
+    Ok((result, layer))
+}
+
 fn check_expr(
     ctx: &mut Context,
     scope: &mut Scope,
     ir: &mut ir::Function,
     ast: &ast::Arena,
+    loop_info: &mut Option<LoopInfo>,
     expr: ast::ExprId,
 ) -> db::Result<ir::VarId> {
     let range = ast.expr[expr].range;
@@ -152,101 +192,160 @@ fn check_expr(
         return Err(db::Diagnostic::error(range, message));
     }
     match &ast.expr[expr].kind {
-        &ast::ExprKind::Parenthesized { inner } => check_expr(ctx, scope, ir, ast, inner),
+        &ast::ExprKind::Parenthesized { inner } => {
+            check_expr(ctx, scope, ir, ast, loop_info, inner)
+        }
         &ast::ExprKind::Integer { literal } => {
-            let destination = ctx.arena.var.push(ctx.constants.integer_type);
-            write(ir, range, InstrKind::Constant { value: literal, destination });
-            Ok(destination)
+            let dst_var = ctx.var(ir, ctx.constants.integer_type);
+            write(ir, range, InstrKind::Constant { value: literal, dst_var });
+            Ok(dst_var)
         }
         &ast::ExprKind::Boolean { literal } => {
-            let destination = ctx.arena.var.push(ctx.constants.boolean_type);
-            write(ir, range, InstrKind::Constant { value: literal as i64, destination });
-            Ok(destination)
+            let dst_var = ctx.var(ir, ctx.constants.boolean_type);
+            write(ir, range, InstrKind::Constant { value: literal as i64, dst_var });
+            Ok(dst_var)
         }
-        ast::ExprKind::Variable { name } => lookup_variable(scope, name),
+        ast::ExprKind::Variable { name } => {
+            let src_var = lookup_variable(scope, name)?;
+            let dst_var = ctx.var(ir, ctx.arena.var[src_var].typ);
+            write(ir, range, InstrKind::Copy { src_var, dst_var });
+            Ok(dst_var)
+        }
         ast::ExprKind::Declaration { name, typ, initializer } => {
-            let init = check_expr(ctx, scope, ir, ast, *initializer)?;
+            let init = check_expr(ctx, scope, ir, ast, loop_info, *initializer)?;
             if let &Some(typ) = typ {
                 let range = ast.expr[*initializer].range;
                 let expected = check_type(ctx, ast, typ)?;
-                expect_type_eq(ctx, range, expected, ctx.arena.var[init])?;
+                expect_type_eq(ctx, range, expected, ctx.arena.var[init].typ)?;
             }
-            scope.bind(name.clone(), init);
+            scope.top().bind(name.clone(), init);
             Ok(ctx.constants.unit_var)
         }
         ast::ExprKind::Block { effects, result } => {
-            scope.stack.push(ScopeLayer::default());
-            for &effect in effects {
-                let destination = check_expr(ctx, scope, ir, ast, effect)?;
-                expect_unit(ctx, ast.expr[effect].range, destination)?;
-            }
-            let result = if let &Some(result) = result {
-                check_expr(ctx, scope, ir, ast, result)?
-            }
-            else {
-                ctx.constants.unit_var
-            };
-            let layer = scope.stack.pop().unwrap();
+            let (result, layer) = with_scope(scope, |scope| {
+                for &effect in effects {
+                    let destination = check_expr(ctx, scope, ir, ast, loop_info, effect)?;
+                    expect_unit(ctx, ast.expr[effect].range, destination)?;
+                }
+                if let &Some(result) = result {
+                    check_expr(ctx, scope, ir, ast, loop_info, result)
+                }
+                else {
+                    Ok(ctx.constants.unit_var)
+                }
+            })?;
             ctx.diagnostics.extend(unused_variable_warnings(&layer));
             if layer.diverged { Ok(never_var(ctx)) } else { Ok(result) }
         }
         &ast::ExprKind::Return { result } => {
             if let Some(result) = result {
-                let value = check_expr(ctx, scope, ir, ast, result)?;
-                expect_type_eq(ctx, ast.expr[result].range, ir.return_type, ctx.arena.var[value])?;
-                write(ir, range, InstrKind::Return { value });
+                let var = check_expr(ctx, scope, ir, ast, loop_info, result)?;
+                expect_type_eq(
+                    ctx,
+                    ast.expr[result].range,
+                    ir.return_type,
+                    ctx.arena.var[var].typ,
+                )?;
+                write(ir, range, InstrKind::Return { var });
             }
             else if matches!(ctx.arena.typ[ir.return_type], ir::Type::Unit) {
-                write(ir, range, InstrKind::Return { value: ctx.constants.unit_var });
+                write(ir, range, InstrKind::Return { var: ctx.constants.unit_var });
             }
             else {
                 return Err(db::Diagnostic::error(range, "Missing return value"));
             }
-            scope.top().diverged = true;
-            Ok(never_var(ctx))
+            Ok(diverge(ctx, scope))
         }
-        &ast::ExprKind::Conditional { condition: condition_ast, true_branch, false_branch } => {
-            let condition = check_expr(ctx, scope, ir, ast, condition_ast)?;
-            expect_boolean(ctx, ast.expr[condition_ast].range, condition)?;
-            let branch_placeholder = write(ir, range, ir::InstrKind::Placeholder);
-            let then_offset = ir.instructions.len();
-            let true_branch = check_expr(ctx, scope, ir, ast, true_branch)?;
+        &ast::ExprKind::Conditional { condition, true_branch, false_branch } => {
+            let condition_var = check_expr(ctx, scope, ir, ast, loop_info, condition)?;
+            expect_boolean(ctx, ast.expr[condition].range, condition_var)?;
+
+            let (then_label, else_label, exit_label) = (ctx.label(), ctx.label(), ctx.label());
+            write(ir, range, InstrKind::ConditionalJump { condition_var, then_label, else_label });
+            write(ir, range, InstrKind::Label { label: then_label });
+
+            let (true_branch_var, layer) =
+                with_scope(scope, |scope| check_expr(ctx, scope, ir, ast, loop_info, true_branch))?;
+            ctx.diagnostics.extend(unused_variable_warnings(&layer));
+
             if let Some(false_branch) = false_branch {
-                let copy_placeholder = write(ir, range, ir::InstrKind::Placeholder);
-                let exit_placeholder = write(ir, range, ir::InstrKind::Placeholder);
-                let else_offset = ir.instructions.len();
-                let false_branch = check_expr(ctx, scope, ir, ast, false_branch)?;
+                let copy_placeholder = write(ir, range, InstrKind::Placeholder);
+                write(ir, range, InstrKind::Jump { target_label: exit_label });
+                write(ir, range, InstrKind::Label { label: else_label });
+
+                let (false_branch_var, layer) = with_scope(scope, |scope| {
+                    check_expr(ctx, scope, ir, ast, loop_info, false_branch)
+                })?;
+                ctx.diagnostics.extend(unused_variable_warnings(&layer));
+
                 expect_type_eq(
                     ctx,
                     range,
-                    ctx.arena.var[true_branch],
-                    ctx.arena.var[false_branch],
+                    ctx.arena.var[true_branch_var].typ,
+                    ctx.arena.var[false_branch_var].typ,
                 )?;
-                let destination = ctx.arena.var.push(ctx.arena.var[true_branch]);
-                patch(ir, copy_placeholder, InstrKind::Copy { source: false_branch, destination });
-                write(ir, range, InstrKind::Copy { source: false_branch, destination });
-                let branch = ir::InstrKind::ConditionalJump { condition, then_offset, else_offset };
-                patch(ir, branch_placeholder, branch);
-                let skip = ir::InstrKind::Jump { target_offset: ir.instructions.len() };
-                patch(ir, exit_placeholder, skip);
-                Ok(destination)
+
+                let dst_var = ctx.var(ir, ctx.arena.var[true_branch_var].typ);
+                patch(ir, copy_placeholder, InstrKind::Copy { src_var: true_branch_var, dst_var });
+                write(ir, range, InstrKind::Copy { src_var: false_branch_var, dst_var });
+                write(ir, range, InstrKind::Label { label: exit_label });
+                Ok(dst_var)
             }
             else {
-                expect_unit(ctx, range, true_branch)?;
-                let else_offset = ir.instructions.len();
-                let branch = ir::InstrKind::ConditionalJump { condition, then_offset, else_offset };
-                patch(ir, branch_placeholder, branch);
-                Ok(ctx.constants.unit_var)
+                expect_unit(ctx, ast.expr[true_branch].range, true_branch_var)?;
+                write(ir, range, InstrKind::Label { label: else_label });
+                Ok(true_branch_var)
             }
         }
-        ast::ExprKind::WhileLoop { condition: _, body: _ } => {
+        &ast::ExprKind::WhileLoop { condition, body } => {
+            let (start_label, then_label, else_label) = (ctx.label(), ctx.label(), ctx.label());
+            write(ir, range, InstrKind::Label { label: start_label });
+
+            let condition_var = check_expr(ctx, scope, ir, ast, loop_info, condition)?;
+            expect_boolean(ctx, ast.expr[condition].range, condition_var)?;
+
+            write(ir, range, InstrKind::ConditionalJump { condition_var, then_label, else_label });
+            write(ir, range, InstrKind::Label { label: then_label });
+
+            let mut loop_info = Some(LoopInfo::default());
+            let (body_var, layer) =
+                with_scope(scope, |scope| check_expr(ctx, scope, ir, ast, &mut loop_info, body))?;
+            ctx.diagnostics.extend(unused_variable_warnings(&layer));
+            expect_unit(ctx, ast.expr[body].range, body_var)?;
+            write(ir, range, InstrKind::Jump { target_label: start_label });
+
+            if let Some(LoopInfo { break_offsets, continue_offsets }) = loop_info {
+                for break_offset in break_offsets {
+                    patch(ir, break_offset, InstrKind::Jump { target_label: else_label });
+                }
+                for continue_offset in continue_offsets {
+                    patch(ir, continue_offset, InstrKind::Jump { target_label: start_label });
+                }
+            }
+
+            write(ir, range, InstrKind::Label { label: else_label });
+            Ok(ctx.constants.unit_var)
+        }
+        ast::ExprKind::Break { result: Some(_) } => {
             todo!()
         }
-        ast::ExprKind::Break { result: _ } => {
-            todo!()
+        ast::ExprKind::Break { result: None } => {
+            if let Some(loop_info) = loop_info {
+                loop_info.break_offsets.push(write(ir, range, InstrKind::Placeholder));
+                Ok(diverge(ctx, scope))
+            }
+            else {
+                Err(db::Diagnostic::error(range, "Break outside of a loop"))
+            }
         }
         ast::ExprKind::Continue => {
-            todo!()
+            if let Some(loop_info) = loop_info {
+                loop_info.continue_offsets.push(write(ir, range, InstrKind::Placeholder));
+                Ok(diverge(ctx, scope))
+            }
+            else {
+                Err(db::Diagnostic::error(range, "Continue outside of a loop"))
+            }
         }
         ast::ExprKind::UnaryCall { operand: _, operator: _ } => {
             todo!()
@@ -257,17 +356,57 @@ fn check_expr(
                 let message = "The left-hand side of an assignment must be an identifier";
                 return Err(db::Diagnostic::error(ast.expr[left].range, message));
             };
-            let destination = lookup_variable(scope, name)?;
-            let source = check_expr(ctx, scope, ir, ast, right)?;
-            write(ir, range, InstrKind::Copy { source, destination });
+            let dst_var = lookup_variable(scope, name)?;
+            let src_var = check_expr(ctx, scope, ir, ast, loop_info, right)?;
+            write(ir, range, InstrKind::Copy { src_var, dst_var });
             Ok(ctx.constants.unit_var)
+        }
+        &ast::ExprKind::InfixCall { left, right, operator: ast::BinaryOp::LogicAnd } => {
+            let (continue_label, break_label, exit_label) = (ctx.label(), ctx.label(), ctx.label());
+            let dst_var = ctx.var(ir, ctx.constants.boolean_type);
+            let lhs = check_expr(ctx, scope, ir, ast, loop_info, left)?;
+            expect_boolean(ctx, ast.expr[left].range, lhs)?;
+            write(ir, range, InstrKind::ConditionalJump {
+                condition_var: lhs,
+                then_label: continue_label,
+                else_label: break_label,
+            });
+            write(ir, range, InstrKind::Label { label: continue_label });
+            let rhs = check_expr(ctx, scope, ir, ast, loop_info, right)?;
+            expect_boolean(ctx, ast.expr[right].range, rhs)?;
+            write(ir, range, InstrKind::Copy { src_var: rhs, dst_var });
+            write(ir, range, InstrKind::Jump { target_label: exit_label });
+            write(ir, range, InstrKind::Label { label: break_label });
+            write(ir, range, InstrKind::Constant { value: 0, dst_var });
+            write(ir, range, InstrKind::Label { label: exit_label });
+            Ok(dst_var)
+        }
+        &ast::ExprKind::InfixCall { left, right, operator: ast::BinaryOp::LogicOr } => {
+            let (continue_label, break_label, exit_label) = (ctx.label(), ctx.label(), ctx.label());
+            let dst_var = ctx.var(ir, ctx.constants.boolean_type);
+            let lhs = check_expr(ctx, scope, ir, ast, loop_info, left)?;
+            expect_boolean(ctx, ast.expr[left].range, lhs)?;
+            write(ir, range, InstrKind::ConditionalJump {
+                condition_var: lhs,
+                then_label: break_label,
+                else_label: continue_label,
+            });
+            write(ir, range, InstrKind::Label { label: continue_label });
+            let rhs = check_expr(ctx, scope, ir, ast, loop_info, right)?;
+            expect_boolean(ctx, ast.expr[right].range, rhs)?;
+            write(ir, range, InstrKind::Copy { src_var: rhs, dst_var });
+            write(ir, range, InstrKind::Jump { target_label: exit_label });
+            write(ir, range, InstrKind::Label { label: break_label });
+            write(ir, range, InstrKind::Constant { value: 1, dst_var });
+            write(ir, range, InstrKind::Label { label: exit_label });
+            Ok(dst_var)
         }
         &ast::ExprKind::InfixCall { left: _, right: _, operator: _ } => {
             todo!()
         }
         ast::ExprKind::FunctionCall { function, arguments } => {
-            let function_var = check_expr(ctx, scope, ir, ast, *function)?;
-            let function_type = ctx.arena.var[function_var];
+            let function_var = check_expr(ctx, scope, ir, ast, loop_info, *function)?;
+            let function_type = ctx.arena.var[function_var].typ;
             let ir::Type::Function { params, ret: return_type } =
                 ctx.arena.typ[function_type].clone()
             else {
@@ -287,14 +426,18 @@ fn check_expr(
             }
             let arguments = std::iter::zip(params.iter(), arguments.iter())
                 .map(|(&param, &arg)| {
-                    let arg_var = check_expr(ctx, scope, ir, ast, arg)?;
-                    expect_type_eq(ctx, ast.expr[arg].range, param, ctx.arena.var[arg_var])?;
+                    let arg_var = check_expr(ctx, scope, ir, ast, loop_info, arg)?;
+                    expect_type_eq(ctx, ast.expr[arg].range, param, ctx.arena.var[arg_var].typ)?;
                     Ok(arg_var)
                 })
                 .collect::<db::Result<_>>()?;
-            let destination = ctx.arena.var.push(return_type);
-            write(ir, range, InstrKind::Call { destination, function: function_var, arguments });
-            Ok(destination)
+            let dst_var = ctx.var(ir, return_type);
+            write(ir, range, InstrKind::Call {
+                dst_var,
+                fn_var: function_var,
+                arg_vars: arguments,
+            });
+            Ok(dst_var)
         }
     }
 }
@@ -312,7 +455,7 @@ fn check_type(ctx: &mut Context, ast: &ast::Arena, typ: ast::TypeId) -> db::Resu
         ast::TypeKind::Function { params, ret } => {
             let ret = check_type(ctx, ast, *ret)?;
             let params =
-                params.iter().map(|&typ| check_type(ctx, ast, typ)).collect::<Result<_, _>>()?;
+                params.iter().map(|&typ| check_type(ctx, ast, typ)).collect::<db::Result<_>>()?;
             Ok(ctx.arena.typ.push(ir::Type::Function { params, ret }))
         }
     }
@@ -320,26 +463,50 @@ fn check_type(ctx: &mut Context, ast: &ast::Arena, typ: ast::TypeId) -> db::Resu
 
 fn check_function(
     ctx: &mut Context,
-    global: &mut Scope,
+    scope: &mut Scope,
     ast: &ast::Arena,
     function: &ast::Function,
 ) -> db::Result<ir::Function> {
-    let return_type = function
-        .return_type
-        .map_or(Ok(ctx.constants.unit_type), |typ| check_type(ctx, ast, typ))?;
-    let mut ir =
-        ir::Function { name: function.name.clone(), return_type, instructions: Vec::new() };
-    let body = check_expr(ctx, global, &mut ir, ast, function.body)?;
-    expect_type_eq(ctx, ast.expr[function.body].range, return_type, ctx.arena.var[body])?;
+    let (ir, layer) = with_scope(scope, |scope| {
+        if !function.parameters.is_empty() {
+            todo!();
+        }
+        let ret = function
+            .return_type
+            .map_or(Ok(ctx.constants.unit_type), |typ| check_type(ctx, ast, typ))?;
+        let mut ir = ir::Function {
+            name: function.name.clone(),
+            typ: ctx.arena.typ.push(ir::Type::Function { params: Vec::new(), ret }),
+            return_type: ret,
+            instructions: Vec::new(),
+            locals_space: 0,
+        };
+        let body = check_expr(ctx, scope, &mut ir, ast, &mut None, function.body)?;
+        expect_type_eq(ctx, ast.expr[function.body].range, ret, ctx.arena.var[body].typ)?;
+        write(&mut ir, ast.expr[function.body].range, InstrKind::Return { var: body });
+        if function.name.string == "main" {
+            if !function.parameters.is_empty() {
+                let message = "The main function must not have parameters";
+                return Err(db::Diagnostic::error(function.name.range, message));
+            }
+            if !matches!(ctx.arena.typ[ret], ir::Type::Integer | ir::Type::Unit) {
+                let message = "The main function must return either Int or Unit";
+                return Err(db::Diagnostic::error(function.name.range, message));
+            }
+        }
+        Ok(ir)
+    })?;
+    ctx.diagnostics.extend(unused_variable_warnings(&layer));
     Ok(ir)
 }
 
 pub fn typecheck(ast::Module { top_level, arena }: ast::Module) -> ir::Program {
     let mut ctx = Context::new();
     let mut functions = Vec::new();
+    let mut scope = Scope::default();
 
     for top_level in top_level {
-        let mut scope = Scope { stack: vec![ScopeLayer::default()] };
+        scope.stack.resize_with(1, ScopeLayer::default);
         match top_level {
             ast::TopLevel::Expr(expr) => {
                 let message = "Top-level expressions are not supported yet";
@@ -347,7 +514,11 @@ pub fn typecheck(ast::Module { top_level, arena }: ast::Module) -> ir::Program {
             }
             ast::TopLevel::Func(func) => {
                 match check_function(&mut ctx, &mut scope, &arena, &arena.func[func]) {
-                    Ok(function) => functions.push(function),
+                    Ok(function) => {
+                        let var = ctx.arena.var.push(ir::Variable::builtin(function.typ));
+                        scope.bottom().bind(function.name.clone(), var);
+                        functions.push(function);
+                    }
                     Err(diagnostic) => ctx.diagnostics.push(diagnostic),
                 }
             }

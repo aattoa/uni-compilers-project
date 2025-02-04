@@ -4,31 +4,39 @@ use crate::{db, define_index};
 define_index!(pub TypeId);
 define_index!(pub VarId);
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Label {
+    pub index: usize,
+}
+
 #[derive(Clone, Debug)]
 pub enum InstrKind {
     Constant {
         value: i64,
-        destination: VarId,
+        dst_var: VarId,
     },
     Copy {
-        source: VarId,
-        destination: VarId,
+        src_var: VarId,
+        dst_var: VarId,
     },
     Call {
-        destination: VarId,
-        function: VarId,
-        arguments: Vec<VarId>,
+        dst_var: VarId,
+        fn_var: VarId,
+        arg_vars: Vec<VarId>,
     },
     Return {
-        value: VarId,
+        var: VarId,
+    },
+    Label {
+        label: Label,
     },
     Jump {
-        target_offset: usize,
+        target_label: Label,
     },
     ConditionalJump {
-        condition: VarId,
-        then_offset: usize,
-        else_offset: usize,
+        condition_var: VarId,
+        then_label: Label,
+        else_label: Label,
     },
     Placeholder,
 }
@@ -48,17 +56,25 @@ pub enum Type {
     Function { params: Vec<TypeId>, ret: TypeId },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Variable {
+    pub typ: TypeId,
+    pub frame_offset: Option<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: db::Name,
+    pub typ: TypeId,
     pub return_type: TypeId,
     pub instructions: Vec<Instruction>,
+    pub locals_space: usize,
 }
 
 #[derive(Default)]
 pub struct Arena {
     pub typ: IndexVec<Type, TypeId>,
-    pub var: IndexVec<TypeId, VarId>,
+    pub var: IndexVec<Variable, VarId>,
 }
 
 pub struct Constants {
@@ -74,12 +90,27 @@ pub struct Program {
     pub diagnostics: Vec<db::Diagnostic>,
 }
 
+impl Type {
+    pub fn size_bytes(&self) -> usize {
+        match self {
+            Type::Integer | Type::Boolean | Type::Function { params: _, ret: _ } => 8,
+            Type::Unit | Type::Never => 0,
+        }
+    }
+}
+
+impl Variable {
+    pub fn builtin(typ: TypeId) -> Self {
+        Self { typ, frame_offset: None }
+    }
+}
+
 impl Constants {
     pub fn new(arena: &mut Arena) -> Self {
         let integer_type = arena.typ.push(Type::Integer);
         let boolean_type = arena.typ.push(Type::Boolean);
         let unit_type = arena.typ.push(Type::Unit);
-        let unit_var = arena.var.push(unit_type);
+        let unit_var = arena.var.push(Variable::builtin(unit_type));
         Self { integer_type, boolean_type, unit_type, unit_var }
     }
 }
