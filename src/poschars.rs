@@ -9,7 +9,7 @@ pub struct PosChars<'a> {
     next: Option<char>,
 }
 
-impl<'a> Iterator for PosChars<'a> {
+impl Iterator for PosChars<'_> {
     type Item = char;
     fn next(&mut self) -> Option<char> {
         self.next.take().or_else(|| self.chars.next()).inspect(|&char| self.position.advance(char))

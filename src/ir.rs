@@ -1,5 +1,5 @@
 use crate::indexvec::IndexVec;
-use crate::{db, define_index};
+use crate::{ast, db, define_index};
 
 define_index!(pub TypeId);
 define_index!(pub VarId);
@@ -57,9 +57,24 @@ pub enum Type {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum Builtin {
+    Unit,
+    Never,
+    BinOp(ast::BinaryOp),
+    UnOp(ast::UnaryOp),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum VariableKind {
+    Local { frame_offset: isize },
+    Builtin { tag: Builtin },
+    Function { index: usize },
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Variable {
     pub typ: TypeId,
-    pub frame_offset: Option<usize>,
+    pub kind: VariableKind,
 }
 
 #[derive(Clone, Debug)]
@@ -68,7 +83,8 @@ pub struct Function {
     pub typ: TypeId,
     pub return_type: TypeId,
     pub instructions: Vec<Instruction>,
-    pub locals_space: usize,
+    pub locals: usize,
+    pub params: usize,
 }
 
 #[derive(Default)]
@@ -78,6 +94,9 @@ pub struct Arena {
 }
 
 pub struct Constants {
+    pub int_negate_type: TypeId,
+    pub int_binop_type: TypeId,
+    pub bool_not_type: TypeId,
     pub integer_type: TypeId,
     pub boolean_type: TypeId,
     pub unit_type: TypeId,
@@ -91,17 +110,17 @@ pub struct Program {
 }
 
 impl Type {
-    pub fn size_bytes(&self) -> usize {
-        match self {
-            Type::Integer | Type::Boolean | Type::Function { params: _, ret: _ } => 8,
-            Type::Unit | Type::Never => 0,
-        }
+    pub fn is_zero_sized(&self) -> bool {
+        matches!(self, Type::Unit | Type::Never)
     }
 }
 
 impl Variable {
-    pub fn builtin(typ: TypeId) -> Self {
-        Self { typ, frame_offset: None }
+    pub fn local(typ: TypeId, frame_offset: isize) -> Variable {
+        Variable { typ, kind: VariableKind::Local { frame_offset } }
+    }
+    pub fn builtin(typ: TypeId, tag: Builtin) -> Variable {
+        Variable { typ, kind: VariableKind::Builtin { tag } }
     }
 }
 
@@ -110,17 +129,27 @@ impl Constants {
         let integer_type = arena.typ.push(Type::Integer);
         let boolean_type = arena.typ.push(Type::Boolean);
         let unit_type = arena.typ.push(Type::Unit);
-        let unit_var = arena.var.push(Variable::builtin(unit_type));
-        Self { integer_type, boolean_type, unit_type, unit_var }
+        let unit_var = arena.var.push(Variable::builtin(unit_type, Builtin::Unit));
+
+        Self {
+            integer_type,
+            boolean_type,
+            unit_type,
+            unit_var,
+            int_binop_type: arena.typ.push(Type::Function {
+                params: vec![integer_type, integer_type],
+                ret: integer_type,
+            }),
+            bool_not_type: (arena.typ)
+                .push(Type::Function { params: vec![boolean_type], ret: boolean_type }),
+            int_negate_type: (arena.typ)
+                .push(Type::Function { params: vec![integer_type], ret: integer_type }),
+        }
     }
 }
 
-pub trait ArenaDisplay {
-    fn display(self, arena: &Arena) -> impl std::fmt::Display;
-}
-
-impl ArenaDisplay for TypeId {
-    fn display(self, arena: &Arena) -> impl std::fmt::Display {
+impl TypeId {
+    pub fn display(self, arena: &Arena) -> impl std::fmt::Display + '_ {
         TypeDisplay { id: self, arena }
     }
 }

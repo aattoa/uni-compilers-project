@@ -158,6 +158,7 @@ fn binary_op(token: Token, ctx: &Context) -> Option<ast::BinaryOp> {
         TokenKind::Minus => Some(Subtract),
         TokenKind::Star => Some(Multiply),
         TokenKind::Slash => Some(Divide),
+        TokenKind::Percent => Some(Modulo),
         TokenKind::Identifier => match token.range.view(ctx.document) {
             "and" => Some(LogicAnd),
             "or" => Some(LogicOr),

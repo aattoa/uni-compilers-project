@@ -1,4 +1,4 @@
-use crate::ir::{self, ArenaDisplay, InstrKind};
+use crate::ir::{self, InstrKind};
 use crate::{ast, db};
 
 struct Binding {
@@ -57,9 +57,8 @@ impl Context {
         ir::Label { index }
     }
     fn var(&mut self, ir: &mut ir::Function, typ: ir::TypeId) -> ir::VarId {
-        let var = ir::Variable { typ, frame_offset: Some(ir.locals_space) };
-        ir.locals_space += self.arena.typ[typ].size_bytes();
-        self.arena.var.push(var)
+        ir.locals += 1;
+        self.arena.var.push(ir::Variable::local(typ, ir.locals as isize * -8))
     }
 }
 
@@ -124,6 +123,10 @@ fn expect_boolean(ctx: &mut Context, range: db::Range, variable: ir::VarId) -> d
     expect_type_eq(ctx, range, ctx.constants.boolean_type, ctx.arena.var[variable].typ)
 }
 
+fn expect_integer(ctx: &mut Context, range: db::Range, variable: ir::VarId) -> db::Result<()> {
+    expect_type_eq(ctx, range, ctx.constants.integer_type, ctx.arena.var[variable].typ)
+}
+
 fn lookup_variable(scope: &mut Scope, name: &db::Name) -> db::Result<ir::VarId> {
     for layer in scope.stack.iter_mut().rev() {
         for binding in layer.bindings.iter_mut().rev() {
@@ -143,13 +146,14 @@ fn unused_variable_warnings(layer: &ScopeLayer) -> impl Iterator<Item = db::Diag
     layer.bindings.iter().filter(|binding| !binding.used).map(move |binding| warn(&binding.name))
 }
 
-fn never_var(ctx: &mut Context) -> ir::VarId {
-    ctx.arena.var.push(ir::Variable::builtin(ctx.arena.typ.push(ir::Type::Never)))
+fn fresh_never_var(ctx: &mut Context) -> ir::VarId {
+    let typ = ctx.arena.typ.push(ir::Type::Never);
+    ctx.arena.var.push(ir::Variable::builtin(typ, ir::Builtin::Never))
 }
 
 fn diverge(ctx: &mut Context, scope: &mut Scope) -> ir::VarId {
     scope.top().diverged = true;
-    never_var(ctx)
+    fresh_never_var(ctx)
 }
 
 fn write(ir: &mut ir::Function, range: db::Range, kind: InstrKind) -> usize {
@@ -235,7 +239,7 @@ fn check_expr(
                 }
             })?;
             ctx.diagnostics.extend(unused_variable_warnings(&layer));
-            if layer.diverged { Ok(never_var(ctx)) } else { Ok(result) }
+            if layer.diverged { Ok(fresh_never_var(ctx)) } else { Ok(result) }
         }
         &ast::ExprKind::Return { result } => {
             if let Some(result) = result {
@@ -347,8 +351,33 @@ fn check_expr(
                 Err(db::Diagnostic::error(range, "Continue outside of a loop"))
             }
         }
-        ast::ExprKind::UnaryCall { operand: _, operator: _ } => {
-            todo!()
+        &ast::ExprKind::UnaryCall { operand, operator: op @ ast::UnaryOp::Negate } => {
+            let dst_var = ctx.var(ir, ctx.constants.integer_type);
+            let argument = check_expr(ctx, scope, ir, ast, loop_info, operand)?;
+            expect_integer(ctx, ast.expr[operand].range, argument)?;
+            write(ir, range, InstrKind::Call {
+                dst_var,
+                fn_var: ctx.arena.var.push(ir::Variable::builtin(
+                    ctx.constants.int_negate_type,
+                    ir::Builtin::UnOp(op),
+                )),
+                arg_vars: vec![argument],
+            });
+            Ok(dst_var)
+        }
+        &ast::ExprKind::UnaryCall { operand, operator: op @ ast::UnaryOp::LogicNot } => {
+            let dst_var = ctx.var(ir, ctx.constants.boolean_type);
+            let argument = check_expr(ctx, scope, ir, ast, loop_info, operand)?;
+            expect_boolean(ctx, ast.expr[operand].range, argument)?;
+            write(ir, range, InstrKind::Call {
+                dst_var,
+                fn_var: ctx.arena.var.push(ir::Variable::builtin(
+                    ctx.constants.bool_not_type,
+                    ir::Builtin::UnOp(op),
+                )),
+                arg_vars: vec![argument],
+            });
+            Ok(dst_var)
         }
         &ast::ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Assign } => {
             let ast::ExprKind::Variable { name } = &ast.expr[left].kind
@@ -401,8 +430,33 @@ fn check_expr(
             write(ir, range, InstrKind::Label { label: exit_label });
             Ok(dst_var)
         }
+        &ast::ExprKind::InfixCall {
+            left,
+            right,
+            operator:
+                op @ (ast::BinaryOp::Add
+                | ast::BinaryOp::Subtract
+                | ast::BinaryOp::Multiply
+                | ast::BinaryOp::Divide
+                | ast::BinaryOp::Modulo),
+        } => {
+            let dst_var = ctx.var(ir, ctx.constants.integer_type);
+            let lhs = check_expr(ctx, scope, ir, ast, loop_info, left)?;
+            expect_integer(ctx, ast.expr[left].range, lhs)?;
+            let rhs = check_expr(ctx, scope, ir, ast, loop_info, right)?;
+            expect_integer(ctx, ast.expr[right].range, rhs)?;
+            write(ir, range, InstrKind::Call {
+                dst_var,
+                fn_var: ctx.arena.var.push(ir::Variable::builtin(
+                    ctx.constants.int_binop_type,
+                    ir::Builtin::BinOp(op),
+                )),
+                arg_vars: vec![lhs, rhs],
+            });
+            Ok(dst_var)
+        }
         &ast::ExprKind::InfixCall { left: _, right: _, operator: _ } => {
-            todo!()
+            todo!();
         }
         ast::ExprKind::FunctionCall { function, arguments } => {
             let function_var = check_expr(ctx, scope, ir, ast, loop_info, *function)?;
@@ -454,7 +508,7 @@ fn check_type(ctx: &mut Context, ast: &ast::Arena, typ: ast::TypeId) -> db::Resu
         },
         ast::TypeKind::Function { params, ret } => {
             let ret = check_type(ctx, ast, *ret)?;
-            let params =
+            let params: Vec<ir::TypeId> =
                 params.iter().map(|&typ| check_type(ctx, ast, typ)).collect::<db::Result<_>>()?;
             Ok(ctx.arena.typ.push(ir::Type::Function { params, ret }))
         }
@@ -468,19 +522,33 @@ fn check_function(
     function: &ast::Function,
 ) -> db::Result<ir::Function> {
     let (ir, layer) = with_scope(scope, |scope| {
-        if !function.parameters.is_empty() {
-            todo!();
-        }
-        let ret = function
-            .return_type
+        let ret = (function.return_type)
             .map_or(Ok(ctx.constants.unit_type), |typ| check_type(ctx, ast, typ))?;
         let mut ir = ir::Function {
             name: function.name.clone(),
-            typ: ctx.arena.typ.push(ir::Type::Function { params: Vec::new(), ret }),
+            typ: ctx.constants.unit_type, // Real type assigned below
             return_type: ret,
             instructions: Vec::new(),
-            locals_space: 0,
+            locals: 0,
+            params: function.parameters.len(),
         };
+        let mut params = Vec::new();
+
+        for param in function.parameters.iter().take(6) {
+            let typ = check_type(ctx, ast, param.typ)?;
+            let var = ctx.var(&mut ir, typ);
+            scope.top().bind(param.name.clone(), var);
+            params.push(typ);
+        }
+
+        for (index, param) in function.parameters.iter().skip(6).enumerate() {
+            let typ = check_type(ctx, ast, param.typ)?;
+            let var = ctx.arena.var.push(ir::Variable::local(typ, (index + 2) as isize * 8));
+            scope.top().bind(param.name.clone(), var);
+            params.push(typ);
+        }
+
+        ir.typ = ctx.arena.typ.push(ir::Type::Function { params, ret });
         let body = check_expr(ctx, scope, &mut ir, ast, &mut None, function.body)?;
         expect_type_eq(ctx, ast.expr[function.body].range, ret, ctx.arena.var[body].typ)?;
         write(&mut ir, ast.expr[function.body].range, InstrKind::Return { var: body });
@@ -515,7 +583,10 @@ pub fn typecheck(ast::Module { top_level, arena }: ast::Module) -> ir::Program {
             ast::TopLevel::Func(func) => {
                 match check_function(&mut ctx, &mut scope, &arena, &arena.func[func]) {
                     Ok(function) => {
-                        let var = ctx.arena.var.push(ir::Variable::builtin(function.typ));
+                        let var = ctx.arena.var.push(ir::Variable {
+                            typ: function.typ,
+                            kind: ir::VariableKind::Function { index: functions.len() },
+                        });
                         scope.bottom().bind(function.name.clone(), var);
                         functions.push(function);
                     }

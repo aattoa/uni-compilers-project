@@ -102,7 +102,7 @@ fn lex(chars: &mut PosChars) -> Option<Token> {
     Some(Token { kind, range: db::Range { begin, end } })
 }
 
-impl<'a> Iterator for Lexer<'a> {
+impl Iterator for Lexer<'_> {
     type Item = Token;
     fn next(&mut self) -> Option<Token> {
         self.next.take().or_else(|| lex(&mut self.chars))
@@ -204,25 +204,19 @@ mod tests {
 
     #[test]
     fn example() {
-        assert_eq!(
-            token_strings("if a <= bee then print_int(123)"),
-            vec!["if", "a", "<=", "bee", "then", "print_int", "(", "123", ")"]
-        );
+        let tokens = ["if", "a", "<=", "bee", "then", "print_int", "(", "123", ")"];
+        assert_eq!(token_strings("if a <= bee then print_int(123)"), tokens);
     }
 
     #[test]
     fn operators() {
-        assert_eq!(
-            token_strings("+ - * / = == != < <= > >= // + - * / = == != < <= > >="),
-            vec!["+", "-", "*", "/", "=", "==", "!=", "<", "<=", ">", ">="]
-        );
+        let tokens = ["+", "-", "*", "/", "=", "==", "!=", "<", "<=", ">", ">="];
+        assert_eq!(token_strings("+ - * / = == != < <= > >= // + - * / = == != < <= > >="), tokens);
     }
 
     #[test]
     fn comments() {
-        assert_eq!(
-            token_strings("aaa // bbb\n\t\t   // qwerty\n      ccc\n// ddd\n// eee"),
-            vec!["aaa", "ccc"]
-        );
+        let tokens = ["aaa", "ccc"];
+        assert_eq!(token_strings("aaa // bbb\n\t\t   // qwerty\n     ccc\n// ddd\n// eee"), tokens);
     }
 }

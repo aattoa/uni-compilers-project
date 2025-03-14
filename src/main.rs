@@ -2,6 +2,7 @@
 #![feature(trait_alias, let_chains)]
 
 mod ast;
+mod codegen;
 mod db;
 mod indexvec;
 mod ir;
