@@ -181,6 +181,15 @@ fn with_scope<T>(
     Ok((result, layer))
 }
 
+fn discard(ctx: &mut Context, var: ir::VarId, range: db::Range) {
+    if !ctx.arena.typ[ctx.arena.var[var].typ].is_zero_sized() {
+        ctx.diagnostics.push(db::Diagnostic::warning(
+            range,
+            format!("Discarded expression of type {}", ctx.arena.var[var].typ.display(&ctx.arena)),
+        ));
+    }
+}
+
 fn check_expr(
     ctx: &mut Context,
     scope: &mut Scope,
@@ -227,8 +236,8 @@ fn check_expr(
         ast::ExprKind::Block { effects, result } => {
             let (result, layer) = with_scope(scope, |scope| {
                 for &effect in effects {
-                    let destination = check_expr(ctx, scope, ir, ast, loop_info, effect)?;
-                    expect_unit(ctx, ast.expr[effect].range, destination)?;
+                    let dst = check_expr(ctx, scope, ir, ast, loop_info, effect)?;
+                    discard(ctx, dst, ast.expr[effect].range);
                 }
                 if let &Some(result) = result {
                     check_expr(ctx, scope, ir, ast, loop_info, result)
@@ -674,7 +683,7 @@ fn check_main(
     let (result, layer) = with_scope(scope, |scope| {
         for &effect in &module.effects {
             let dst = check_expr(ctx, scope, &mut main, &module.arena, &mut None, effect)?;
-            expect_unit(ctx, module.arena.expr[effect].range, dst)?;
+            discard(ctx, dst, module.arena.expr[effect].range);
         }
         check_expr(ctx, scope, &mut main, &module.arena, &mut None, module.result)
     })?;
