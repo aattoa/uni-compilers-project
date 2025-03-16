@@ -70,13 +70,38 @@ fn codegen_binary_operator(
     else {
         unreachable!("Typechecker should catch argument mismatch");
     };
+    // TODO: deduplicate
     match operator {
-        BinaryOp::EqualEqual => todo!(),
-        BinaryOp::NotEqual => todo!(),
-        BinaryOp::Less => todo!(),
-        BinaryOp::LessEqual => todo!(),
-        BinaryOp::Greater => todo!(),
-        BinaryOp::GreaterEqual => todo!(),
+        BinaryOp::EqualEqual => {
+            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
+            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
+            writeln!(out, "\tsete %al")?;
+        }
+        BinaryOp::NotEqual => {
+            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
+            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
+            writeln!(out, "\tsetne %al")?;
+        }
+        BinaryOp::Less => {
+            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
+            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
+            writeln!(out, "\tsetl %al")?;
+        }
+        BinaryOp::LessEqual => {
+            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
+            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
+            writeln!(out, "\tsetle %al")?;
+        }
+        BinaryOp::Greater => {
+            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
+            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
+            writeln!(out, "\tsetg %al")?;
+        }
+        BinaryOp::GreaterEqual => {
+            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
+            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
+            writeln!(out, "\tsetge %al")?;
+        }
         BinaryOp::Add => {
             writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
             writeln!(out, "\taddq {}, %rax", location(program, rhs))?;
@@ -180,6 +205,12 @@ fn codegen_function(
     program: &ir::Program,
     function: &ir::Function,
 ) -> io::Result<()> {
+    if let Some(asm) = &function.asm {
+        for line in asm {
+            writeln!(out, "{line}")?;
+        }
+        return writeln!(out, "\tret");
+    }
     codegen_prologue(out, function.locals, function.params)?;
     for instruction in &function.instructions {
         writeln!(out, "\t# {:?}", instruction.kind)?;
@@ -192,6 +223,9 @@ fn codegen_function(
 pub fn codegen(out: &mut dyn io::Write, program: &ir::Program) -> io::Result<()> {
     writeln!(out, ".section .text")?;
     writeln!(out, ".extern printf")?;
+    writeln!(out, ".extern scanf")?;
+    writeln!(out, ".extern puts")?;
+
     for function in &program.functions {
         writeln!(out)?;
         writeln!(out, ".global {SYMBOL_PREFIX}{}", function.name.string)?;
@@ -199,17 +233,17 @@ pub fn codegen(out: &mut dyn io::Write, program: &ir::Program) -> io::Result<()>
         writeln!(out, "{SYMBOL_PREFIX}{}:", function.name.string)?;
         codegen_function(out, program, function)?;
     }
+
     writeln!(out, "\n.global main\n.type main, @function\nmain:")?;
     codegen_prologue(out, 0, 0)?;
     writeln!(out, "\t# Call the user-provided main function")?;
     writeln!(out, "\tcallq {SYMBOL_PREFIX}main")?;
-
-    writeln!(out, "\t# Print the return value")?;
-    writeln!(out, "\tmovq %rax, %rsi")?;
-    writeln!(out, "\tmovq $print_format, %rdi")?;
-    writeln!(out, "\tcallq printf")?;
-
     codegen_epilogue(out)?;
-    writeln!(out, "\nprint_format:\n.asciz \"%ld\\n\"")?;
+
+    writeln!(out)?;
+    writeln!(out, "int_scan_format: .asciz \"%ld\"")?;
+    writeln!(out, "int_print_format: .asciz \"%ld\\n\"")?;
+    writeln!(out, "bool_true_string: .asciz \"true\"")?;
+    writeln!(out, "bool_false_string: .asciz \"false\"")?;
     Ok(())
 }

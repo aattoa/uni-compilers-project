@@ -140,10 +140,9 @@ fn lookup_variable(scope: &mut Scope, name: &db::Name) -> db::Result<ir::VarId> 
 }
 
 fn unused_variable_warnings(layer: &ScopeLayer) -> impl Iterator<Item = db::Diagnostic> + '_ {
-    let warn = |name: &db::Name| {
+    layer.bindings.iter().filter(|binding| !binding.used).map(|Binding { name, .. }| {
         db::Diagnostic::warning(name.range, format!("Unused variable: {}", name.string))
-    };
-    layer.bindings.iter().filter(|binding| !binding.used).map(move |binding| warn(&binding.name))
+    })
 }
 
 fn fresh_never_var(ctx: &mut Context) -> ir::VarId {
@@ -277,7 +276,7 @@ fn check_expr(
                 write(ir, range, InstrKind::Jump { target_label: exit_label });
                 write(ir, range, InstrKind::Label { label: else_label });
 
-                let (false_branch_var, layer) = with_scope(scope, |scope| {
+                let (false_branch_var, _layer) = with_scope(scope, |scope| {
                     check_expr(ctx, scope, ir, ast, loop_info, false_branch)
                 })?;
                 ctx.diagnostics.extend(unused_variable_warnings(&layer));
@@ -357,10 +356,8 @@ fn check_expr(
             expect_integer(ctx, ast.expr[operand].range, argument)?;
             write(ir, range, InstrKind::Call {
                 dst_var,
-                fn_var: ctx.arena.var.push(ir::Variable::builtin(
-                    ctx.constants.int_negate_type,
-                    ir::Builtin::UnOp(op),
-                )),
+                fn_var: (ctx.arena.var)
+                    .push(ir::Variable::builtin(ctx.constants.unit_type, ir::Builtin::UnOp(op))),
                 arg_vars: vec![argument],
             });
             Ok(dst_var)
@@ -371,10 +368,8 @@ fn check_expr(
             expect_boolean(ctx, ast.expr[operand].range, argument)?;
             write(ir, range, InstrKind::Call {
                 dst_var,
-                fn_var: ctx.arena.var.push(ir::Variable::builtin(
-                    ctx.constants.bool_not_type,
-                    ir::Builtin::UnOp(op),
-                )),
+                fn_var: (ctx.arena.var)
+                    .push(ir::Variable::builtin(ctx.constants.unit_type, ir::Builtin::UnOp(op))),
                 arg_vars: vec![argument],
             });
             Ok(dst_var)
@@ -447,16 +442,54 @@ fn check_expr(
             expect_integer(ctx, ast.expr[right].range, rhs)?;
             write(ir, range, InstrKind::Call {
                 dst_var,
-                fn_var: ctx.arena.var.push(ir::Variable::builtin(
-                    ctx.constants.int_binop_type,
-                    ir::Builtin::BinOp(op),
-                )),
+                fn_var: (ctx.arena.var)
+                    .push(ir::Variable::builtin(ctx.constants.unit_type, ir::Builtin::BinOp(op))),
                 arg_vars: vec![lhs, rhs],
             });
             Ok(dst_var)
         }
-        &ast::ExprKind::InfixCall { left: _, right: _, operator: _ } => {
-            todo!();
+        &ast::ExprKind::InfixCall {
+            left,
+            right,
+            operator:
+                op @ (ast::BinaryOp::Less
+                | ast::BinaryOp::LessEqual
+                | ast::BinaryOp::Greater
+                | ast::BinaryOp::GreaterEqual),
+        } => {
+            let dst_var = ctx.var(ir, ctx.constants.boolean_type);
+            let lhs = check_expr(ctx, scope, ir, ast, loop_info, left)?;
+            expect_integer(ctx, ast.expr[left].range, lhs)?;
+            let rhs = check_expr(ctx, scope, ir, ast, loop_info, right)?;
+            expect_integer(ctx, ast.expr[right].range, rhs)?;
+            write(ir, range, InstrKind::Call {
+                dst_var,
+                fn_var: (ctx.arena.var)
+                    .push(ir::Variable::builtin(ctx.constants.unit_type, ir::Builtin::BinOp(op))),
+                arg_vars: vec![lhs, rhs],
+            });
+            Ok(dst_var)
+        }
+        &ast::ExprKind::InfixCall {
+            left,
+            right,
+            operator: op @ (ast::BinaryOp::EqualEqual | ast::BinaryOp::NotEqual),
+        } => {
+            let dst_var = ctx.var(ir, ctx.constants.boolean_type);
+
+            let lhs = check_expr(ctx, scope, ir, ast, loop_info, left)?;
+            let rhs = check_expr(ctx, scope, ir, ast, loop_info, right)?;
+
+            expect_type_eq(ctx, range, ctx.arena.var[lhs].typ, ctx.arena.var[rhs].typ)?;
+
+            write(ir, range, InstrKind::Call {
+                dst_var,
+                fn_var: (ctx.arena.var)
+                    .push(ir::Variable::builtin(ctx.constants.unit_type, ir::Builtin::BinOp(op))),
+                arg_vars: vec![lhs, rhs],
+            });
+
+            Ok(dst_var)
         }
         ast::ExprKind::FunctionCall { function, arguments } => {
             let function_var = check_expr(ctx, scope, ir, ast, loop_info, *function)?;
@@ -531,6 +564,7 @@ fn check_function(
             instructions: Vec::new(),
             locals: 0,
             params: function.parameters.len(),
+            asm: None,
         };
         let mut params = Vec::new();
 
@@ -568,10 +602,80 @@ fn check_function(
     Ok(ir)
 }
 
+fn make_builtin(
+    ctx: &mut Context,
+    name: &str,
+    asm: Vec<&'static str>,
+    return_type: ir::TypeId,
+    params: Vec<ir::TypeId>,
+) -> ir::Function {
+    ir::Function {
+        locals: 0,
+        params: params.len(),
+        name: db::Name { string: String::from(name), range: db::Range::default() },
+        typ: ctx.arena.typ.push(ir::Type::Function { params, ret: return_type }),
+        instructions: Vec::new(),
+        return_type,
+        asm: Some(asm),
+    }
+}
+
+// TODO: move to codegen.rs
+fn builtins(ctx: &mut Context) -> Vec<ir::Function> {
+    vec![
+        make_builtin(
+            ctx,
+            "read_int",
+            vec![
+                "\tmovq $int_scan_format, %rdi",
+                "\tleaq -8(%rbp), %rsi",
+                "\tcallq scanf",
+                "\tmovq -8(%rbp), %rax",
+            ],
+            ctx.constants.integer_type,
+            Vec::new(),
+        ),
+        make_builtin(
+            ctx,
+            "print_int",
+            vec!["\tmovq %rdi, %rsi", "\tmovq $int_print_format, %rdi", "\tcallq printf"],
+            ctx.constants.unit_type,
+            vec![ctx.constants.integer_type],
+        ),
+        make_builtin(
+            ctx,
+            "print_bool",
+            vec![
+                "\tcmpq $0, %rdi",
+                "\tjne .Ltrue",
+                "\tmovq $bool_false_string, %rdi",
+                "\tjmp .Lprint_bool",
+                ".Ltrue:",
+                "\tmovq $bool_true_string, %rdi",
+                ".Lprint_bool:",
+                "\tcallq puts",
+            ],
+            ctx.constants.unit_type,
+            vec![ctx.constants.boolean_type],
+        ),
+    ]
+}
+
+fn register_function(ctx: &mut Context, scope: &mut Scope, function: &ir::Function, index: usize) {
+    let var = ir::Variable { typ: function.typ, kind: ir::VariableKind::Function { index } };
+    scope.bottom().bind(function.name.clone(), ctx.arena.var.push(var));
+}
+
 pub fn typecheck(ast::Module { top_level, arena }: ast::Module) -> ir::Program {
     let mut ctx = Context::new();
     let mut functions = Vec::new();
     let mut scope = Scope::default();
+
+    scope.stack.push(ScopeLayer::default());
+    for function in builtins(&mut ctx) {
+        register_function(&mut ctx, &mut scope, &function, functions.len());
+        functions.push(function);
+    }
 
     for top_level in top_level {
         scope.stack.resize_with(1, ScopeLayer::default);
@@ -583,11 +687,7 @@ pub fn typecheck(ast::Module { top_level, arena }: ast::Module) -> ir::Program {
             ast::TopLevel::Func(func) => {
                 match check_function(&mut ctx, &mut scope, &arena, &arena.func[func]) {
                     Ok(function) => {
-                        let var = ctx.arena.var.push(ir::Variable {
-                            typ: function.typ,
-                            kind: ir::VariableKind::Function { index: functions.len() },
-                        });
-                        scope.bottom().bind(function.name.clone(), var);
+                        register_function(&mut ctx, &mut scope, &function, functions.len());
                         functions.push(function);
                     }
                     Err(diagnostic) => ctx.diagnostics.push(diagnostic),

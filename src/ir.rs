@@ -77,7 +77,6 @@ pub struct Variable {
     pub kind: VariableKind,
 }
 
-#[derive(Clone, Debug)]
 pub struct Function {
     pub name: db::Name,
     pub typ: TypeId,
@@ -85,6 +84,7 @@ pub struct Function {
     pub instructions: Vec<Instruction>,
     pub locals: usize,
     pub params: usize,
+    pub asm: Option<Vec<&'static str>>,
 }
 
 #[derive(Default)]
@@ -94,9 +94,6 @@ pub struct Arena {
 }
 
 pub struct Constants {
-    pub int_negate_type: TypeId,
-    pub int_binop_type: TypeId,
-    pub bool_not_type: TypeId,
     pub integer_type: TypeId,
     pub boolean_type: TypeId,
     pub unit_type: TypeId,
@@ -130,21 +127,7 @@ impl Constants {
         let boolean_type = arena.typ.push(Type::Boolean);
         let unit_type = arena.typ.push(Type::Unit);
         let unit_var = arena.var.push(Variable::builtin(unit_type, Builtin::Unit));
-
-        Self {
-            integer_type,
-            boolean_type,
-            unit_type,
-            unit_var,
-            int_binop_type: arena.typ.push(Type::Function {
-                params: vec![integer_type, integer_type],
-                ret: integer_type,
-            }),
-            bool_not_type: (arena.typ)
-                .push(Type::Function { params: vec![boolean_type], ret: boolean_type }),
-            int_negate_type: (arena.typ)
-                .push(Type::Function { params: vec![integer_type], ret: integer_type }),
-        }
+        Self { integer_type, boolean_type, unit_type, unit_var }
     }
 }
 

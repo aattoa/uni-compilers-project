@@ -5,7 +5,7 @@ pub struct Position {
     pub offset: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct Range {
     pub begin: Position,
     pub end: Position,

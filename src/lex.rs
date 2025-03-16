@@ -55,8 +55,8 @@ fn next_token(char: char, chars: &mut PosChars) -> TokenKind {
         '%' => TokenKind::Percent,
 
         '!' => (if chars.consume('=') { TokenKind::NotEqual } else { TokenKind::Error }),
-        '<' => (if chars.consume('=') { TokenKind::Less } else { TokenKind::LessEqual }),
-        '>' => (if chars.consume('=') { TokenKind::Greater } else { TokenKind::GreaterEqual }),
+        '<' => (if chars.consume('=') { TokenKind::LessEqual } else { TokenKind::Less }),
+        '>' => (if chars.consume('=') { TokenKind::GreaterEqual } else { TokenKind::Greater }),
 
         '=' => {
             if chars.consume('=') {
