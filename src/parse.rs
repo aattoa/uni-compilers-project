@@ -30,13 +30,19 @@ impl<'a> Context<'a> {
     }
 }
 
-trait Parser<T> = Fn(&mut Context) -> db::Result<Option<T>>;
-
-fn extract<T>(ctx: &mut Context, parser: impl Parser<T>, desc: &str) -> db::Result<T> {
+fn extract<T>(
+    ctx: &mut Context,
+    parser: impl Fn(&mut Context) -> db::Result<Option<T>>,
+    desc: &str,
+) -> db::Result<T> {
     parser(ctx)?.ok_or_else(|| ctx.expected(desc))
 }
 
-fn extract_sequence<T>(ctx: &mut Context, elem: impl Parser<T>, desc: &str) -> db::Result<Vec<T>> {
+fn extract_sequence<T>(
+    ctx: &mut Context,
+    elem: impl Fn(&mut Context) -> db::Result<Option<T>>,
+    desc: &str,
+) -> db::Result<Vec<T>> {
     let mut vec = Vec::new();
     if let Some(head) = elem(ctx)? {
         vec.push(head);
@@ -215,8 +221,8 @@ fn combined_range(ctx: &Context, left: ExprId, right: ExprId) -> Range {
     Range { begin: ctx.arena.expr[left].range.begin, end: ctx.arena.expr[right].range.end }
 }
 
-fn parse_infix_call(ctx: &mut Context, precedence: usize) -> db::Result<Option<ExprId>> {
-    if precedence == OPERATORS.len() {
+fn parse_infix_call(ctx: &mut Context, prec: usize) -> db::Result<Option<ExprId>> {
+    if prec == OPERATORS.len() {
         let begin = ctx.lexer.current_position();
         Ok(if let Some(kind) = parse_normal_expr(ctx)? {
             let end = ctx.lexer.current_position();
@@ -229,22 +235,21 @@ fn parse_infix_call(ctx: &mut Context, precedence: usize) -> db::Result<Option<E
         })
     }
     else {
-        let Some(mut lhs) = parse_infix_call(ctx, precedence + 1)?
+        let Some(mut lhs) = parse_infix_call(ctx, prec + 1)?
         else {
             return Ok(None);
         };
         while let Some(token) = ctx.lexer.next() {
-            if let Some(operator) = binary_op(token, ctx)
-                && OPERATORS[precedence].contains(&operator)
-            {
-                let rhs = extract(ctx, |ctx| parse_infix_call(ctx, precedence + 1), "an operand")?;
-                let kind = ExprKind::InfixCall { left: lhs, right: rhs, operator };
-                lhs = ctx.arena.expr.push(Expr { kind, range: combined_range(ctx, lhs, rhs) });
+            if let Some(operator) = binary_op(token, ctx) {
+                if OPERATORS[prec].contains(&operator) {
+                    let rhs = extract(ctx, |ctx| parse_infix_call(ctx, prec + 1), "an operand")?;
+                    let kind = ExprKind::InfixCall { left: lhs, right: rhs, operator };
+                    lhs = ctx.arena.expr.push(Expr { kind, range: combined_range(ctx, lhs, rhs) });
+                    continue;
+                }
             }
-            else {
-                ctx.lexer.unlex(token);
-                break;
-            }
+            ctx.lexer.unlex(token);
+            break;
         }
         Ok(Some(lhs))
     }
@@ -252,16 +257,15 @@ fn parse_infix_call(ctx: &mut Context, precedence: usize) -> db::Result<Option<E
 
 fn parse_expr(ctx: &mut Context) -> db::Result<Option<ExprId>> {
     let left = parse_infix_call(ctx, 0)?;
-    if let Some(left) = left
-        && ctx.consume(TokenKind::Equal)
-    {
-        let right = extract(ctx, parse_expr, "an operand")?;
-        let kind = ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Assign };
-        Ok(Some(ctx.arena.expr.push(Expr { kind, range: combined_range(ctx, left, right) })))
+    if let Some(left) = left {
+        if ctx.consume(TokenKind::Equal) {
+            let right = extract(ctx, parse_expr, "an operand")?;
+            let kind = ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Assign };
+            let range = combined_range(ctx, left, right);
+            return Ok(Some(ctx.arena.expr.push(Expr { kind, range })));
+        }
     }
-    else {
-        Ok(left)
-    }
+    Ok(left)
 }
 
 fn extract_function_type(open: Token, ctx: &mut Context) -> db::Result<TypeId> {
