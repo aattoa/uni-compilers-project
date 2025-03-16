@@ -329,27 +329,29 @@ fn extract_function(ctx: &mut Context) -> db::Result<ast::Function> {
     Ok(ast::Function { name, parameters, return_type, body })
 }
 
-fn parse_top_level(ctx: &mut Context) -> db::Result<Option<ast::TopLevel>> {
-    if parse_word(ctx, "fun") {
-        extract_function(ctx).map(|func| Some(ast::TopLevel::Func(ctx.arena.func.push(func))))
-    }
-    else {
-        parse_expr(ctx).map(|expr| expr.map(ast::TopLevel::Expr))
-    }
-}
-
 pub fn parse(document: &str) -> db::Result<ast::Module> {
     let mut ctx = Context::new(document);
-    let mut top_level = Vec::new();
-    while let Some(item) = parse_top_level(&mut ctx)? {
-        top_level.push(item);
-        ctx.consume(TokenKind::Semicolon); // Permit trailing semicolons.
-    }
-    if ctx.lexer.peek().is_none() {
-        Ok(ast::Module { top_level, arena: ctx.arena })
-    }
-    else {
-        Err(ctx.expected("a function, a top level expression, or the end of input"))
+    let mut functions = Vec::new();
+    let mut effects = Vec::new();
+
+    loop {
+        if parse_word(&mut ctx, "fun") {
+            functions.push(extract_function(&mut ctx)?);
+        }
+        else if let Some(expr) = parse_expr(&mut ctx)? {
+            if ctx.consume(TokenKind::Semicolon) {
+                effects.push(expr);
+            }
+            else if ctx.lexer.peek().is_none() {
+                return Ok(ast::Module { arena: ctx.arena, functions, effects, result: expr });
+            }
+            else {
+                return Err(ctx.expected("a semicolon or the end of input"));
+            }
+        }
+        else {
+            return Err(ctx.expected("a function or a top level expression"));
+        }
     }
 }
 
@@ -366,17 +368,13 @@ mod tests {
         assert_let!(TypeKind::Variable { name } = &arena.typ[typ].kind);
         assert_eq!(name.string, str);
     }
-    fn top_level_expr<'a>(top_level: &[ast::TopLevel], arena: &'a ast::Arena) -> &'a ExprKind {
-        assert_let!([ast::TopLevel::Expr(expr_id)] = top_level);
-        &arena.expr[*expr_id].kind
-    }
 
     #[test]
     fn conditional() {
-        let ast::Module { top_level, arena } = parse("if a then b else c").unwrap();
+        let ast::Module { arena, result, .. } = parse("if a then b else c").unwrap();
         assert_let!(
             ExprKind::Conditional { condition, true_branch, false_branch } =
-                top_level_expr(&top_level, &arena)
+                &arena.expr[result].kind
         );
         assert_name(&arena, *condition, "a");
         assert_name(&arena, *true_branch, "b");
@@ -385,10 +383,8 @@ mod tests {
 
     #[test]
     fn declaration() {
-        let ast::Module { top_level, arena } = parse("var a: (A, B) => C = b").unwrap();
-        assert_let!(
-            ExprKind::Declaration { name, typ, initializer } = top_level_expr(&top_level, &arena)
-        );
+        let ast::Module { arena, result, .. } = parse("var a: (A, B) => C = b").unwrap();
+        assert_let!(ExprKind::Declaration { name, typ, initializer } = &arena.expr[result].kind);
         assert_eq!(name.string, "a");
         assert_name(&arena, *initializer, "b");
         assert_let!(TypeKind::Function { params, ret } = &arena.typ[typ.unwrap()].kind);
@@ -400,8 +396,8 @@ mod tests {
 
     #[test]
     fn while_loop() {
-        let ast::Module { top_level, arena } = parse("while a do b").unwrap();
-        assert_let!(ExprKind::WhileLoop { condition, body } = top_level_expr(&top_level, &arena));
+        let ast::Module { arena, result, .. } = parse("while a do b").unwrap();
+        assert_let!(ExprKind::WhileLoop { condition, body } = &arena.expr[result].kind);
         assert_name(&arena, *condition, "a");
         assert_name(&arena, *body, "b");
     }
@@ -409,11 +405,11 @@ mod tests {
     #[test]
     fn precedence() {
         {
-            let ast::Module { top_level, arena } = parse("a + b * c or d and e - f").unwrap(); // ((a + (b * c)) or (d and (e - f)))
+            let ast::Module { arena, result, .. } = parse("a + b * c or d and e - f").unwrap(); // ((a + (b * c)) or (d and (e - f)))
 
             assert_let!(
                 ExprKind::InfixCall { left, right, operator: ast::BinaryOp::LogicOr } =
-                    top_level_expr(&top_level, &arena)
+                    &arena.expr[result].kind
             );
 
             {
@@ -438,8 +434,8 @@ mod tests {
             }
         }
         {
-            let ast::Module { top_level, arena } = parse("return a - b + c").unwrap(); // (return ((a - b) + c))
-            assert_let!(ExprKind::Return { result } = top_level_expr(&top_level, &arena));
+            let ast::Module { arena, result, .. } = parse("return a - b + c").unwrap(); // (return ((a - b) + c))
+            assert_let!(ExprKind::Return { result } = &arena.expr[result].kind);
             assert_let!(
                 ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Add } =
                     arena.expr[result.unwrap()].kind
@@ -453,10 +449,10 @@ mod tests {
             assert_name(&arena, right, "b");
         }
         {
-            let ast::Module { top_level, arena } = parse("(a + b) * c").unwrap();
+            let ast::Module { arena, result, .. } = parse("(a + b) * c").unwrap();
             assert_let!(
                 ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Multiply } =
-                    top_level_expr(&top_level, &arena)
+                    &arena.expr[result].kind
             );
             assert_name(&arena, *right, "c");
             assert_let!(ExprKind::Parenthesized { inner } = arena.expr[*left].kind);
@@ -468,10 +464,10 @@ mod tests {
             assert_name(&arena, right, "b");
         }
         {
-            let ast::Module { top_level, arena } = parse("a = b = c * d + e").unwrap(); // (a = (b = ((c * d) + e)))
+            let ast::Module { arena, result, .. } = parse("a = b = c * d + e").unwrap(); // (a = (b = ((c * d) + e)))
             assert_let!(
                 ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Assign } =
-                    top_level_expr(&top_level, &arena)
+                    &arena.expr[result].kind
             );
             assert_name(&arena, *left, "a");
             assert_let!(
@@ -496,10 +492,8 @@ mod tests {
     #[test]
     fn function_call() {
         {
-            let ast::Module { top_level, arena } = parse("f(a, b, c)").unwrap();
-            assert_let!(
-                ExprKind::FunctionCall { function, arguments } = top_level_expr(&top_level, &arena)
-            );
+            let ast::Module { arena, result, .. } = parse("f(a, b, c)").unwrap();
+            assert_let!(ExprKind::FunctionCall { function, arguments } = &arena.expr[result].kind);
             assert_let!([a, b, c] = arguments.as_slice());
             assert_name(&arena, *function, "f");
             assert_name(&arena, *a, "a");
@@ -507,10 +501,10 @@ mod tests {
             assert_name(&arena, *c, "c");
         }
         {
-            let ast::Module { top_level, arena } = parse("-f(a)(b)").unwrap();
+            let ast::Module { arena, result, .. } = parse("-f(a)(b)").unwrap();
             assert_let!(
                 ExprKind::UnaryCall { operand, operator: ast::UnaryOp::Negate } =
-                    top_level_expr(&top_level, &arena)
+                    &arena.expr[result].kind
             );
             assert_let!(
                 ExprKind::FunctionCall { function, arguments } = &arena.expr[*operand].kind
@@ -528,9 +522,8 @@ mod tests {
 
     #[test]
     fn function_definition() {
-        let ast::Module { top_level, arena } = parse("fun id(x: T): R { x; y; z }").unwrap();
-        assert_let!([ast::TopLevel::Func(func_id)] = top_level.as_slice());
-        let ast::Function { name, parameters, return_type, body } = &arena.func[*func_id];
+        let ast::Module { arena, functions, .. } = parse("fun id(x: T): R { x; y; z } 0").unwrap();
+        assert_let!([ast::Function { name, parameters, return_type, body }] = functions.as_slice());
         assert_eq!(name.string, "id");
         assert_typename(&arena, return_type.unwrap(), "R");
 

@@ -586,16 +586,6 @@ fn check_function(
         let body = check_expr(ctx, scope, &mut ir, ast, &mut None, function.body)?;
         expect_type_eq(ctx, ast.expr[function.body].range, ret, ctx.arena.var[body].typ)?;
         write(&mut ir, ast.expr[function.body].range, InstrKind::Return { var: body });
-        if function.name.string == "main" {
-            if !function.parameters.is_empty() {
-                let message = "The main function must not have parameters";
-                return Err(db::Diagnostic::error(function.name.range, message));
-            }
-            if !matches!(ctx.arena.typ[ret], ir::Type::Integer | ir::Type::Unit) {
-                let message = "The main function must return either Int or Unit";
-                return Err(db::Diagnostic::error(function.name.range, message));
-            }
-        }
         Ok(ir)
     })?;
     ctx.diagnostics.extend(unused_variable_warnings(&layer));
@@ -612,7 +602,7 @@ fn make_builtin(
     ir::Function {
         locals: 0,
         params: params.len(),
-        name: db::Name { string: String::from(name), range: db::Range::default() },
+        name: db::Name::builtin(name),
         typ: ctx.arena.typ.push(ir::Type::Function { params, ret: return_type }),
         instructions: Vec::new(),
         return_type,
@@ -666,7 +656,52 @@ fn register_function(ctx: &mut Context, scope: &mut Scope, function: &ir::Functi
     scope.bottom().bind(function.name.clone(), ctx.arena.var.push(var));
 }
 
-pub fn typecheck(ast::Module { top_level, arena }: ast::Module) -> ir::Program {
+fn check_main(
+    ctx: &mut Context,
+    scope: &mut Scope,
+    module: &ast::Module,
+) -> db::Result<ir::Function> {
+    let mut main = ir::Function {
+        name: db::Name::builtin("main"),
+        typ: ctx.constants.unit_type,
+        return_type: ctx.constants.unit_type,
+        instructions: Vec::new(),
+        locals: 0,
+        params: 0,
+        asm: None,
+    };
+
+    let (result, layer) = with_scope(scope, |scope| {
+        for &effect in &module.effects {
+            let dst = check_expr(ctx, scope, &mut main, &module.arena, &mut None, effect)?;
+            expect_unit(ctx, module.arena.expr[effect].range, dst)?;
+        }
+        check_expr(ctx, scope, &mut main, &module.arena, &mut None, module.result)
+    })?;
+    ctx.diagnostics.extend(unused_variable_warnings(&layer));
+
+    match &ctx.arena.typ[ctx.arena.var[result].typ] {
+        ir::Type::Integer => {
+            write(&mut main, db::Range::default(), InstrKind::Call {
+                dst_var: ctx.constants.unit_var,
+                fn_var: lookup_variable(scope, &db::Name::builtin("print_int"))?,
+                arg_vars: vec![result],
+            });
+        }
+        ir::Type::Boolean => {
+            write(&mut main, db::Range::default(), InstrKind::Call {
+                dst_var: ctx.constants.unit_var,
+                fn_var: lookup_variable(scope, &db::Name::builtin("print_bool"))?,
+                arg_vars: vec![result],
+            });
+        }
+        _ => {}
+    }
+
+    Ok(main)
+}
+
+pub fn typecheck(module: ast::Module) -> db::Result<ir::Program> {
     let mut ctx = Context::new();
     let mut functions = Vec::new();
     let mut scope = Scope::default();
@@ -677,24 +712,13 @@ pub fn typecheck(ast::Module { top_level, arena }: ast::Module) -> ir::Program {
         functions.push(function);
     }
 
-    for top_level in top_level {
+    for function in &module.functions {
+        let function = check_function(&mut ctx, &mut scope, &module.arena, function)?;
+        register_function(&mut ctx, &mut scope, &function, functions.len());
+        functions.push(function);
         scope.stack.resize_with(1, ScopeLayer::default);
-        match top_level {
-            ast::TopLevel::Expr(expr) => {
-                let message = "Top-level expressions are not supported yet";
-                ctx.diagnostics.push(db::Diagnostic::error(arena.expr[expr].range, message));
-            }
-            ast::TopLevel::Func(func) => {
-                match check_function(&mut ctx, &mut scope, &arena, &arena.func[func]) {
-                    Ok(function) => {
-                        register_function(&mut ctx, &mut scope, &function, functions.len());
-                        functions.push(function);
-                    }
-                    Err(diagnostic) => ctx.diagnostics.push(diagnostic),
-                }
-            }
-        }
     }
 
-    ir::Program { functions, arena: ctx.arena, diagnostics: ctx.diagnostics }
+    functions.push(check_main(&mut ctx, &mut scope, &module)?);
+    Ok(ir::Program { functions, arena: ctx.arena, diagnostics: ctx.diagnostics })
 }

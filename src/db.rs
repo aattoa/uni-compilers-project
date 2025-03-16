@@ -70,3 +70,9 @@ impl Diagnostic {
         Self { message: message.into(), range, severity: Severity::Warning }
     }
 }
+
+impl Name {
+    pub fn builtin(name: &str) -> Self {
+        Self { string: String::from(name), range: Range::default() }
+    }
+}

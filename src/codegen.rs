@@ -161,7 +161,6 @@ fn codegen_instruction(
                         }
                         ir::Builtin::Unit | ir::Builtin::Never => unreachable!(),
                     };
-                    writeln!(out, "\tmovq %rax, {}", location(program, dst_var))?;
                 }
                 ir::VariableKind::Local { frame_offset } => {
                     for (var, reg) in arg_vars.iter().copied().zip(PARAM_REGS) {
@@ -171,11 +170,23 @@ fn codegen_instruction(
                         writeln!(out, "\tpushq {}", location(program, var))?;
                     }
                     writeln!(out, "\tcallq *{}(%rbp)", frame_offset)?;
-                    writeln!(out, "\tmovq %rax, {}", location(program, dst_var))?;
                 }
-                ir::VariableKind::Function { index: _ } => {
-                    todo!();
+                ir::VariableKind::Function { index } => {
+                    for (var, reg) in arg_vars.iter().copied().zip(PARAM_REGS) {
+                        writeln!(out, "\tmovq {}, %{}", location(program, var), reg)?;
+                    }
+                    for var in arg_vars.iter().copied().skip(PARAM_REGS.len()).rev() {
+                        writeln!(out, "\tpushq {}", location(program, var))?;
+                    }
+                    writeln!(
+                        out,
+                        "\tcallq {SYMBOL_PREFIX}{}",
+                        program.functions[index].name.string
+                    )?;
                 }
+            };
+            if !program.arena.typ[program.arena.var[dst_var].typ].is_zero_sized() {
+                writeln!(out, "\tmovq %rax, {}", location(program, dst_var))?;
             }
         }
         &ir::InstrKind::Return { var } => {

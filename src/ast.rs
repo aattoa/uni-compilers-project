@@ -3,7 +3,6 @@ use crate::{db, define_index};
 
 define_index!(pub ExprId);
 define_index!(pub TypeId);
-define_index!(pub FuncId);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BinaryOp {
@@ -115,20 +114,15 @@ pub struct Function {
     pub body: ExprId,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum TopLevel {
-    Expr(ExprId),
-    Func(FuncId),
-}
-
 #[derive(Default)]
 pub struct Arena {
     pub expr: IndexVec<Expr, ExprId>,
     pub typ: IndexVec<Type, TypeId>,
-    pub func: IndexVec<Function, FuncId>,
 }
 
 pub struct Module {
-    pub top_level: Vec<TopLevel>,
     pub arena: Arena,
+    pub functions: Vec<Function>,
+    pub effects: Vec<ExprId>,
+    pub result: ExprId,
 }

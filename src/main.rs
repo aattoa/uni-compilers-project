@@ -34,10 +34,14 @@ impl<T: ToString> From<T> for Error {
     }
 }
 
-fn compile(id: usize, code: &str) -> Result<String, Error> {
-    let program = typecheck::typecheck(parse::parse(code).map_err(|diag| {
+fn analyze(code: &str) -> Result<ir::Program, Error> {
+    parse::parse(code).and_then(typecheck::typecheck).map_err(|diag| {
         Error::from(format!("{}-{}: {}", diag.range.begin, diag.range.end, diag.message))
-    })?);
+    })
+}
+
+fn compile(id: usize, code: &str) -> Result<String, Error> {
+    let program = analyze(code)?;
 
     use std::process::{Command, Stdio};
     let mut child = Command::new("/bin/sh")
@@ -111,7 +115,7 @@ fn main() -> std::io::Result<()> {
     }
     else {
         let code = std::fs::read_to_string("test-program")?;
-        let program = typecheck::typecheck(parse::parse(&code).unwrap());
+        let program = analyze(&code).unwrap();
         codegen::codegen(&mut std::io::stdout(), &program)?;
         for db::Diagnostic { message, range, severity } in &program.diagnostics {
             eprintln!("{:?} {}-{}: {}", severity, range.begin, range.end, message);
