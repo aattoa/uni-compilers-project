@@ -6,11 +6,19 @@ struct Context<'a> {
     arena: ast::Arena,
     lexer: Lexer<'a>,
     document: &'a str,
+    was_block: bool,
+    is_block: bool,
 }
 
 impl<'a> Context<'a> {
     fn new(document: &'a str) -> Self {
-        Self { arena: ast::Arena::default(), lexer: Lexer::new(document), document }
+        Self {
+            arena: ast::Arena::default(),
+            lexer: Lexer::new(document),
+            document,
+            was_block: false,
+            is_block: false,
+        }
     }
     fn error(&mut self, message: impl Into<String>) -> Diagnostic {
         Diagnostic::error(self.lexer.current_range(), message)
@@ -81,22 +89,33 @@ fn extract_integer(token: Token, ctx: &mut Context) -> db::Result<ExprKind> {
 }
 
 fn extract_block(_open: Token, ctx: &mut Context) -> db::Result<ExprKind> {
+    let old_is_block = std::mem::replace(&mut ctx.is_block, true);
+
     let mut effects = Vec::new();
     let mut result = None;
     while let Some(expr) = parse_expr(ctx)? {
-        if ctx.consume(TokenKind::Semicolon) {
-            effects.push(expr);
-        }
-        else {
+        if ctx.lexer.peek().is_some_and(|token| token.kind == TokenKind::BraceClose) {
             result = Some(expr);
             break;
         }
+        let was_block = std::mem::take(&mut ctx.was_block);
+        if !ctx.consume(TokenKind::Semicolon) && !was_block {
+            return Err(ctx.expected("a semicolon or a closing brace"));
+        }
+        effects.push(expr);
     }
+
+    ctx.was_block = true;
+    ctx.is_block = old_is_block;
+
     ctx.expect(TokenKind::BraceClose)?;
     Ok(ExprKind::Block { effects, result })
 }
 
-fn extract_declaration(_var: Token, ctx: &mut Context) -> db::Result<ExprKind> {
+fn extract_declaration(var: Token, ctx: &mut Context) -> db::Result<ExprKind> {
+    if !ctx.is_block {
+        return Err(db::Diagnostic::error(var.range, "Variable declaration outside of a block"));
+    }
     let name = extract_name(ctx)?;
     let typ = parse_type_annotation(ctx)?;
     ctx.expect(TokenKind::Equal)?;
@@ -112,6 +131,7 @@ fn extract_while(_while: Token, ctx: &mut Context) -> db::Result<ExprKind> {
 }
 
 fn extract_conditional(_open: Token, ctx: &mut Context) -> db::Result<ExprKind> {
+    let old_is_block = std::mem::replace(&mut ctx.is_block, false);
     let condition = extract(ctx, parse_expr, "a condition")?;
     extract_word(ctx, "then")?;
     let true_branch = extract(ctx, parse_expr, "the true branch")?;
@@ -121,6 +141,7 @@ fn extract_conditional(_open: Token, ctx: &mut Context) -> db::Result<ExprKind> 
     else {
         None
     };
+    ctx.is_block = old_is_block;
     Ok(ExprKind::Conditional { condition, true_branch, false_branch })
 }
 
@@ -174,6 +195,19 @@ fn binary_op(token: Token, ctx: &Context) -> Option<ast::BinaryOp> {
     }
 }
 
+fn extract_negate(ctx: &mut Context) -> db::Result<ExprKind> {
+    if let Some(token) = ctx.lexer.next_if_kind(TokenKind::Integer) {
+        // A bit of a hack, maybe clean up later.
+        match format!("-{}", token.range.view(ctx.document)).parse() {
+            Ok(literal) => Ok(ExprKind::Integer { literal }),
+            Err(error) => Err(Diagnostic::error(token.range, error.to_string())),
+        }
+    }
+    else {
+        extract_unary(ast::UnaryOp::Negate, ctx)
+    }
+}
+
 fn parse_normal_expr(ctx: &mut Context) -> db::Result<Option<ExprKind>> {
     let Some(token) = ctx.lexer.next()
     else {
@@ -184,7 +218,7 @@ fn parse_normal_expr(ctx: &mut Context) -> db::Result<Option<ExprKind>> {
         TokenKind::Integer => extract_integer(token, ctx).map(Some),
         TokenKind::BraceOpen => extract_block(token, ctx).map(Some),
         TokenKind::ParenOpen => extract_paren(token, ctx).map(Some),
-        TokenKind::Minus => extract_unary(ast::UnaryOp::Negate, ctx).map(Some),
+        TokenKind::Minus => extract_negate(ctx).map(Some),
         _ => {
             ctx.lexer.unlex(token);
             Ok(None)
@@ -333,26 +367,35 @@ pub fn parse(document: &str) -> db::Result<ast::Module> {
     let mut ctx = Context::new(document);
     let mut functions = Vec::new();
     let mut effects = Vec::new();
+    let mut result = None;
 
     loop {
-        if parse_word(&mut ctx, "fun") {
+        if ctx.lexer.peek().is_none() {
+            break;
+        }
+        else if parse_word(&mut ctx, "fun") {
             functions.push(extract_function(&mut ctx)?);
         }
-        else if let Some(expr) = parse_expr(&mut ctx)? {
-            if ctx.consume(TokenKind::Semicolon) {
+        else {
+            ctx.is_block = true;
+            if let Some(expr) = parse_expr(&mut ctx)? {
+                if ctx.lexer.peek().is_none() {
+                    result = Some(expr);
+                    break;
+                }
+                if !ctx.consume(TokenKind::Semicolon) && !std::mem::take(&mut ctx.was_block) {
+                    return Err(ctx.expected("a semicolon or the end of input"));
+                }
                 effects.push(expr);
             }
-            else if ctx.lexer.peek().is_none() {
-                return Ok(ast::Module { arena: ctx.arena, functions, effects, result: expr });
-            }
             else {
-                return Err(ctx.expected("a semicolon or the end of input"));
+                return Err(ctx.expected("a function or an expression"));
             }
-        }
-        else {
-            return Err(ctx.expected("a function or a top level expression"));
+            ctx.is_block = false;
         }
     }
+
+    Ok(ast::Module { arena: ctx.arena, functions, effects, result })
 }
 
 #[cfg(test)]
@@ -374,7 +417,7 @@ mod tests {
         let ast::Module { arena, result, .. } = parse("if a then b else c").unwrap();
         assert_let!(
             ExprKind::Conditional { condition, true_branch, false_branch } =
-                &arena.expr[result].kind
+                &arena.expr[result.unwrap()].kind
         );
         assert_name(&arena, *condition, "a");
         assert_name(&arena, *true_branch, "b");
@@ -383,8 +426,11 @@ mod tests {
 
     #[test]
     fn declaration() {
-        let ast::Module { arena, result, .. } = parse("var a: (A, B) => C = b").unwrap();
-        assert_let!(ExprKind::Declaration { name, typ, initializer } = &arena.expr[result].kind);
+        let ast::Module { arena, result, .. } = parse("{ var a: (A, B) => C = b }").unwrap();
+        assert_let!(ExprKind::Block { result, .. } = &arena.expr[result.unwrap()].kind);
+        assert_let!(
+            ExprKind::Declaration { name, typ, initializer } = &arena.expr[result.unwrap()].kind
+        );
         assert_eq!(name.string, "a");
         assert_name(&arena, *initializer, "b");
         assert_let!(TypeKind::Function { params, ret } = &arena.typ[typ.unwrap()].kind);
@@ -397,7 +443,7 @@ mod tests {
     #[test]
     fn while_loop() {
         let ast::Module { arena, result, .. } = parse("while a do b").unwrap();
-        assert_let!(ExprKind::WhileLoop { condition, body } = &arena.expr[result].kind);
+        assert_let!(ExprKind::WhileLoop { condition, body } = &arena.expr[result.unwrap()].kind);
         assert_name(&arena, *condition, "a");
         assert_name(&arena, *body, "b");
     }
@@ -409,7 +455,7 @@ mod tests {
 
             assert_let!(
                 ExprKind::InfixCall { left, right, operator: ast::BinaryOp::LogicOr } =
-                    &arena.expr[result].kind
+                    &arena.expr[result.unwrap()].kind
             );
 
             {
@@ -435,7 +481,7 @@ mod tests {
         }
         {
             let ast::Module { arena, result, .. } = parse("return a - b + c").unwrap(); // (return ((a - b) + c))
-            assert_let!(ExprKind::Return { result } = &arena.expr[result].kind);
+            assert_let!(ExprKind::Return { result } = &arena.expr[result.unwrap()].kind);
             assert_let!(
                 ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Add } =
                     arena.expr[result.unwrap()].kind
@@ -452,7 +498,7 @@ mod tests {
             let ast::Module { arena, result, .. } = parse("(a + b) * c").unwrap();
             assert_let!(
                 ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Multiply } =
-                    &arena.expr[result].kind
+                    &arena.expr[result.unwrap()].kind
             );
             assert_name(&arena, *right, "c");
             assert_let!(ExprKind::Parenthesized { inner } = arena.expr[*left].kind);
@@ -467,7 +513,7 @@ mod tests {
             let ast::Module { arena, result, .. } = parse("a = b = c * d + e").unwrap(); // (a = (b = ((c * d) + e)))
             assert_let!(
                 ExprKind::InfixCall { left, right, operator: ast::BinaryOp::Assign } =
-                    &arena.expr[result].kind
+                    &arena.expr[result.unwrap()].kind
             );
             assert_name(&arena, *left, "a");
             assert_let!(
@@ -493,7 +539,9 @@ mod tests {
     fn function_call() {
         {
             let ast::Module { arena, result, .. } = parse("f(a, b, c)").unwrap();
-            assert_let!(ExprKind::FunctionCall { function, arguments } = &arena.expr[result].kind);
+            assert_let!(
+                ExprKind::FunctionCall { function, arguments } = &arena.expr[result.unwrap()].kind
+            );
             assert_let!([a, b, c] = arguments.as_slice());
             assert_name(&arena, *function, "f");
             assert_name(&arena, *a, "a");
@@ -504,7 +552,7 @@ mod tests {
             let ast::Module { arena, result, .. } = parse("-f(a)(b)").unwrap();
             assert_let!(
                 ExprKind::UnaryCall { operand, operator: ast::UnaryOp::Negate } =
-                    &arena.expr[result].kind
+                    &arena.expr[result.unwrap()].kind
             );
             assert_let!(
                 ExprKind::FunctionCall { function, arguments } = &arena.expr[*operand].kind

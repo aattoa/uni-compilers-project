@@ -12,6 +12,7 @@ mod typecheck;
 mod util;
 
 use serde_json::{Value as Json, json};
+use std::process::{Command, Stdio};
 
 #[derive(PartialEq, Eq, Debug, serde::Deserialize)]
 #[serde(tag = "command")]
@@ -43,25 +44,17 @@ fn analyze(code: &str) -> Result<ir::Program, Error> {
 fn compile(id: usize, code: &str) -> Result<String, Error> {
     let program = analyze(code)?;
 
-    use std::process::{Command, Stdio};
     let mut child = Command::new("/bin/sh")
         .arg("-c")
-        .arg("mkdir -p \"$1\" && cd \"$1\" && gcc -x assembler -g -no-pie -o program - && base64 program")
+        .arg("musl-gcc -z noexecstack -x assembler -static -no-pie -o $1 - && base64 $1 && rm $1")
         .arg("--")
-        .arg(format!("/tmp/compilers-project/{id}"))
+        .arg(id.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .spawn()?;
 
     codegen::codegen(&mut child.stdin.take().unwrap(), &program)?;
-
-    if child.wait()?.success() {
-        Ok(std::io::read_to_string(child.stdout.take().unwrap())?)
-    }
-    else {
-        Err(Error::from(std::io::read_to_string(child.stderr.take().unwrap())?))
-    }
+    Ok(std::io::read_to_string(child.stdout.take().unwrap())?)
 }
 
 fn handle(id: usize, reader: impl std::io::Read) -> Result<Json, Error> {
@@ -126,7 +119,7 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Request;
 
     fn request(str: &str) -> Request {
         serde_json::from_str(str).unwrap()

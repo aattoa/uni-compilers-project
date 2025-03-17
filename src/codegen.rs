@@ -60,6 +60,18 @@ fn codegen_unary_operator(
     Ok(())
 }
 
+fn codegen_comparison(
+    out: &mut dyn io::Write,
+    program: &ir::Program,
+    set: &str,
+    (lhs, rhs): (ir::VarId, ir::VarId),
+) -> io::Result<()> {
+    writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
+    writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
+    writeln!(out, "\t{set} %al")?;
+    Ok(())
+}
+
 fn codegen_binary_operator(
     out: &mut dyn io::Write,
     program: &ir::Program,
@@ -70,38 +82,14 @@ fn codegen_binary_operator(
     else {
         unreachable!("Typechecker should catch argument mismatch");
     };
-    // TODO: deduplicate
     match operator {
-        BinaryOp::EqualEqual => {
-            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
-            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
-            writeln!(out, "\tsete %al")?;
-        }
-        BinaryOp::NotEqual => {
-            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
-            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
-            writeln!(out, "\tsetne %al")?;
-        }
-        BinaryOp::Less => {
-            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
-            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
-            writeln!(out, "\tsetl %al")?;
-        }
-        BinaryOp::LessEqual => {
-            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
-            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
-            writeln!(out, "\tsetle %al")?;
-        }
-        BinaryOp::Greater => {
-            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
-            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
-            writeln!(out, "\tsetg %al")?;
-        }
-        BinaryOp::GreaterEqual => {
-            writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
-            writeln!(out, "\tcmpq {}, %rax", location(program, rhs))?;
-            writeln!(out, "\tsetge %al")?;
-        }
+        BinaryOp::EqualEqual => codegen_comparison(out, program, "sete", (lhs, rhs))?,
+        BinaryOp::NotEqual => codegen_comparison(out, program, "setne", (lhs, rhs))?,
+        BinaryOp::Less => codegen_comparison(out, program, "setl", (lhs, rhs))?,
+        BinaryOp::LessEqual => codegen_comparison(out, program, "setle", (lhs, rhs))?,
+        BinaryOp::Greater => codegen_comparison(out, program, "setg", (lhs, rhs))?,
+        BinaryOp::GreaterEqual => codegen_comparison(out, program, "setge", (lhs, rhs))?,
+
         BinaryOp::Add => {
             writeln!(out, "\tmovq {}, %rax", location(program, lhs))?;
             writeln!(out, "\taddq {}, %rax", location(program, rhs))?;
@@ -129,6 +117,33 @@ fn codegen_binary_operator(
             unreachable!("These are special cases")
         }
     };
+    Ok(())
+}
+
+fn codegen_function_call(
+    out: &mut dyn io::Write,
+    locals: usize,
+    program: &ir::Program,
+    function: &str,
+    arguments: &[ir::VarId],
+) -> io::Result<()> {
+    for (var, reg) in arguments.iter().copied().zip(PARAM_REGS) {
+        writeln!(out, "\tmovq {}, %{}", location(program, var), reg)?;
+    }
+    for var in arguments.iter().copied().skip(PARAM_REGS.len()).rev() {
+        writeln!(out, "\tpushq {}", location(program, var))?;
+    }
+    if locals % 2 != 0 {
+        writeln!(out, "\tsubq $8, %rsp")?;
+    }
+    writeln!(out, "\tcallq {function}")?;
+    if locals % 2 != 0 {
+        writeln!(out, "\taddq $8, %rsp")?;
+    }
+    let stack_args = arguments.iter().skip(PARAM_REGS.len()).len();
+    if stack_args != 0 {
+        writeln!(out, "\taddq ${}, %rsp", stack_args * 8)?;
+    }
     Ok(())
 }
 
@@ -163,26 +178,12 @@ fn codegen_instruction(
                     };
                 }
                 ir::VariableKind::Local { frame_offset } => {
-                    for (var, reg) in arg_vars.iter().copied().zip(PARAM_REGS) {
-                        writeln!(out, "\tmovq {}, %{}", location(program, var), reg)?;
-                    }
-                    for var in arg_vars.iter().copied().skip(PARAM_REGS.len()).rev() {
-                        writeln!(out, "\tpushq {}", location(program, var))?;
-                    }
-                    writeln!(out, "\tcallq *{}(%rbp)", frame_offset)?;
+                    let fun = format!("*{}(%rbp)", frame_offset);
+                    codegen_function_call(out, function.locals, program, &fun, arg_vars)?;
                 }
                 ir::VariableKind::Function { index } => {
-                    for (var, reg) in arg_vars.iter().copied().zip(PARAM_REGS) {
-                        writeln!(out, "\tmovq {}, %{}", location(program, var), reg)?;
-                    }
-                    for var in arg_vars.iter().copied().skip(PARAM_REGS.len()).rev() {
-                        writeln!(out, "\tpushq {}", location(program, var))?;
-                    }
-                    writeln!(
-                        out,
-                        "\tcallq {SYMBOL_PREFIX}{}",
-                        program.functions[index].name.string
-                    )?;
+                    let fun = format!("{SYMBOL_PREFIX}{}", program.functions[index].name.string);
+                    codegen_function_call(out, function.locals, program, &fun, arg_vars)?;
                 }
             };
             if !program.arena.typ[program.arena.var[dst_var].typ].is_zero_sized() {
@@ -248,7 +249,9 @@ pub fn codegen(out: &mut dyn io::Write, program: &ir::Program) -> io::Result<()>
     writeln!(out, "\n.global main\n.type main, @function\nmain:")?;
     codegen_prologue(out, 0, 0)?;
     writeln!(out, "\t# Call the user-provided main function")?;
+    writeln!(out, "\tsubq $8, %rsp")?;
     writeln!(out, "\tcallq {SYMBOL_PREFIX}main")?;
+    writeln!(out, "\tmovq $0, %rax")?;
     codegen_epilogue(out)?;
 
     writeln!(out)?;

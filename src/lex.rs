@@ -82,14 +82,19 @@ fn next_token(char: char, chars: &mut PosChars) -> TokenKind {
     }
 }
 
-fn skip_trivia(chars: &mut PosChars) {
+fn skip_trivia(chars: &mut PosChars) -> Option<()> {
     loop {
         while chars.next_if(|char| char.is_ascii_whitespace()).is_some() {}
-        if chars.starts_with("//") {
+        if chars.starts_with("//") || chars.consume('#') {
             while chars.next().is_some_and(|char| char != '\n') {}
         }
+        else if chars.starts_with("/*") {
+            while !chars.consume('*') || !chars.consume('/') {
+                chars.next()?;
+            }
+        }
         else {
-            break;
+            return Some(());
         }
     }
 }
@@ -218,5 +223,11 @@ mod tests {
     fn comments() {
         let tokens = ["aaa", "ccc"];
         assert_eq!(token_strings("aaa // bbb\n\t\t   // qwerty\n     ccc\n// ddd\n// eee"), tokens);
+    }
+
+    #[test]
+    fn multiline_comments() {
+        let tokens = ["aaa", "ccc", "eee"];
+        assert_eq!(token_strings("aaa /* bbb */ ccc/*ddd*/eee"), tokens);
     }
 }

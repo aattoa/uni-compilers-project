@@ -124,5 +124,5 @@ pub struct Module {
     pub arena: Arena,
     pub functions: Vec<Function>,
     pub effects: Vec<ExprId>,
-    pub result: ExprId,
+    pub result: Option<ExprId>,
 }
