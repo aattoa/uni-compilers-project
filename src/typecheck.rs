@@ -343,24 +343,31 @@ fn check_expr(
             expect_unit(ctx, ast.expr[body].range, body_var)?;
             write(ir, range, InstrKind::Jump { target_label: start_label });
 
-            if let Some(LoopInfo { break_offsets, continue_offsets }) = loop_info {
-                for break_offset in break_offsets {
-                    patch(ir, break_offset, InstrKind::Jump { target_label: else_label });
-                }
-                for continue_offset in continue_offsets {
-                    patch(ir, continue_offset, InstrKind::Jump { target_label: start_label });
-                }
+            let LoopInfo { break_offsets, continue_offsets } = loop_info.unwrap();
+            for &break_offset in &break_offsets {
+                patch(ir, break_offset, InstrKind::Jump { target_label: else_label });
             }
-
+            for &continue_offset in &continue_offsets {
+                patch(ir, continue_offset, InstrKind::Jump { target_label: start_label });
+            }
             write(ir, range, InstrKind::Label { label: else_label });
-            Ok(ctx.constants.unit_var)
+
+            let is_while_true =
+                matches!(ast.expr[condition].kind, ast::ExprKind::Boolean { literal: true });
+
+            if is_while_true && break_offsets.is_empty() {
+                Ok(diverge(ctx, scope))
+            }
+            else {
+                Ok(ctx.constants.unit_var)
+            }
         }
-        ast::ExprKind::Break { result: Some(_) } => {
-            todo!()
+        &ast::ExprKind::Break { result: Some(_) } => {
+            todo!();
         }
-        ast::ExprKind::Break { result: None } => {
-            if let Some(loop_info) = loop_info {
-                loop_info.break_offsets.push(write(ir, range, InstrKind::Placeholder));
+        &ast::ExprKind::Break { result: None } => {
+            if let Some(info) = loop_info {
+                info.break_offsets.push(write(ir, range, InstrKind::Placeholder));
                 Ok(diverge(ctx, scope))
             }
             else {
