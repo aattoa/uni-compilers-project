@@ -207,6 +207,7 @@ fn codegen_instruction(
             writeln!(out, "\tjne .L{}", then_label.index)?;
             writeln!(out, "\tjmp .L{}", else_label.index)?;
         }
+        ir::InstrKind::NoOp => {}
         ir::InstrKind::Placeholder => unreachable!("Placeholder should have been patched out"),
     }
     Ok(())
@@ -217,19 +218,22 @@ fn codegen_function(
     program: &ir::Program,
     function: &ir::Function,
 ) -> io::Result<()> {
-    if let Some(asm) = &function.asm {
-        for line in asm {
-            writeln!(out, "{line}")?;
-        }
-        return writeln!(out, "\tret");
-    }
     codegen_prologue(out, function.locals, function.params)?;
     for instruction in &function.instructions {
         writeln!(out, "\t# {:?}", instruction.kind)?;
         codegen_instruction(out, program, function, instruction)?;
     }
     writeln!(out, ".Lepilogue_{SYMBOL_PREFIX}{}:", function.name.string)?;
-    codegen_epilogue(out)
+    codegen_epilogue(out)?;
+    Ok(())
+}
+
+fn write_function_header(out: &mut dyn io::Write, name: &str) -> io::Result<()> {
+    writeln!(out)?;
+    writeln!(out, ".global {SYMBOL_PREFIX}{name}")?;
+    writeln!(out, ".type {SYMBOL_PREFIX}{name}, @function")?;
+    writeln!(out, "{SYMBOL_PREFIX}{name}:")?;
+    Ok(())
 }
 
 pub fn codegen(out: &mut dyn io::Write, program: &ir::Program) -> io::Result<()> {
@@ -238,26 +242,54 @@ pub fn codegen(out: &mut dyn io::Write, program: &ir::Program) -> io::Result<()>
     writeln!(out, ".extern scanf")?;
     writeln!(out, ".extern puts")?;
 
-    for function in &program.functions {
-        writeln!(out)?;
-        writeln!(out, ".global {SYMBOL_PREFIX}{}", function.name.string)?;
-        writeln!(out, ".type {SYMBOL_PREFIX}{}, @function", function.name.string)?;
-        writeln!(out, "{SYMBOL_PREFIX}{}:", function.name.string)?;
+    write_builtins(out)?;
+
+    for function in program.functions.iter().filter(|function| !function.builtin) {
+        write_function_header(out, &function.name.string)?;
         codegen_function(out, program, function)?;
     }
 
     writeln!(out, "\n.global main\n.type main, @function\nmain:")?;
     codegen_prologue(out, 0, 0)?;
-    writeln!(out, "\t# Call the user-provided main function")?;
     writeln!(out, "\tsubq $8, %rsp")?;
     writeln!(out, "\tcallq {SYMBOL_PREFIX}main")?;
     writeln!(out, "\tmovq $0, %rax")?;
     codegen_epilogue(out)?;
 
+    Ok(())
+}
+
+fn write_builtins(out: &mut dyn io::Write) -> io::Result<()> {
     writeln!(out)?;
     writeln!(out, "int_scan_format: .asciz \"%ld\"")?;
     writeln!(out, "int_print_format: .asciz \"%ld\\n\"")?;
     writeln!(out, "bool_true_string: .asciz \"true\"")?;
     writeln!(out, "bool_false_string: .asciz \"false\"")?;
+
+    write_function_header(out, "read_int")?;
+    codegen_prologue(out, 1, 0)?;
+    writeln!(out, "\tmovq $int_scan_format, %rdi")?;
+    writeln!(out, "\tleaq -8(%rbp), %rsi")?;
+    writeln!(out, "\tcallq scanf")?;
+    writeln!(out, "\tmovq -8(%rbp), %rax")?;
+    codegen_epilogue(out)?;
+
+    write_function_header(out, "print_int")?;
+    writeln!(out, "\tmovq %rdi, %rsi")?;
+    writeln!(out, "\tmovq $int_print_format, %rdi")?;
+    writeln!(out, "\tcallq printf")?;
+    writeln!(out, "\tret")?;
+
+    write_function_header(out, "print_bool")?;
+    writeln!(out, "\tcmpq $0, %rdi")?;
+    writeln!(out, "\tjne .Ltrue")?;
+    writeln!(out, "\tmovq $bool_false_string, %rdi")?;
+    writeln!(out, "\tjmp .Lprint_bool")?;
+    writeln!(out, ".Ltrue:")?;
+    writeln!(out, "\tmovq $bool_true_string, %rdi")?;
+    writeln!(out, ".Lprint_bool:")?;
+    writeln!(out, "\tcallq puts")?;
+    writeln!(out, "\tret")?;
+
     Ok(())
 }

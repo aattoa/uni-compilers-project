@@ -38,6 +38,7 @@ pub enum InstrKind {
         then_label: Label,
         else_label: Label,
     },
+    NoOp,
     Placeholder,
 }
 
@@ -84,7 +85,7 @@ pub struct Function {
     pub instructions: Vec<Instruction>,
     pub locals: usize,
     pub params: usize,
-    pub asm: Option<Vec<&'static str>>,
+    pub builtin: bool,
 }
 
 #[derive(Default)]
